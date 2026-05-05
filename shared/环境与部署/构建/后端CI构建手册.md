@@ -1,15 +1,15 @@
-# 后端 CI 构建手册（HuLa-Server）
+# 后端构建与运行手册（HuLa-Server + aichat-plugins）
 
-> 面向：DevOps（石哥）
+> 面向：DevOps（石哥）、tester
 > 责任人：backend（峰哥）
-> 更新日期：2026-03-12
-> 目标：从源代码到可运行服务镜像的完整 CI 构建流程说明
+> 更新日期：2026-05-05
+> 目标：后端开发容器编译 + Runtime 运行环境搭建说明
 
 ---
 
 ## 一、后端服务架构速览
 
-HuLa-Server 是 Spring Cloud 微服务架构，CI 需构建 **4 个独立服务**，通过 API 网关对外暴露统一入口：
+HuLa-Server 是 Spring Cloud 微服务架构，实际运行 **4 个核心服务**，通过 API 网关对外暴露统一入口：
 
 | 服务模块 | 容器内端口 | 对外 | 说明 |
 |---------|-----------|------|------|
@@ -17,6 +17,7 @@ HuLa-Server 是 Spring Cloud 微服务架构，CI 需构建 **4 个独立服务*
 | `luohuo-oauth-server`   | 18761 | ❌ 内部 | 认证服务（登录/Token） |
 | `luohuo-ws-server`      | 18762 | ❌ 内部 | WebSocket 长连接 |
 | `luohuo-im-server`      | 18763 | ❌ 内部 | IM 业务（消息/好友/群） |
+| ~~`luohuo-system-server`~~ | 18764 | — | **不使用**（AI/LLM 能力层） |
 
 前端只需访问 **网关（18760）**，其余端口是微服务内部路由，不对外暴露。
 
@@ -26,10 +27,10 @@ HuLa-Server 是 Spring Cloud 微服务架构，CI 需构建 **4 个独立服务*
 
 | 依赖 | 版本 | 说明 |
 |------|------|------|
-| Docker | ≥ 24 | 宿主机无需安装 Java/Maven，构建全部在容器内完成 |
+| Docker | ≥ 24 | 宿主机无需安装 Java/Maven/Node，全部走容器 |
 | Docker Compose | ≥ 2.20 | |
 | Git | 任意 | 拉取源码 |
-| 外部 MySQL | 10.38.10.10:3306 | 数据库 `hula`，用户 `openclaw/a`（历史用户名） |
+| 外部 MySQL | 10.38.10.10:3306 | 数据库 `hula`，用户 `openclaw/a` |
 | 外部 Redis | 10.38.10.10:6379 | 密码 `a` |
 | 外部 RocketMQ | 10.38.10.10:9876 | NameServer，无 ACL |
 
@@ -41,111 +42,76 @@ HuLa-Server 是 Spring Cloud 微服务架构，CI 需构建 **4 个独立服务*
 HuLa-Server/
 ├── luohuo-util/        ← ⚠️ 工具模块，必须最先构建并 install 到本地 Maven
 │   └── luohuo-parent/
-└── luohuo-cloud/       ← 主多模块项目（4 个服务都在这里）
+└── luohuo-cloud/       ← 主多模块项目
     ├── luohuo-dependencies-parent/
     ├── luohuo-public/
-    ├── luohuo-gateway/
-    │   └── luohuo-gateway-server/  ← 网关服务入口
-    ├── luohuo-oauth/
-    │   └── luohuo-oauth-server/    ← 认证服务入口
-    ├── luohuo-ws/
-    │   └── luohuo-ws-server/       ← WS 服务入口
-    ├── luohuo-im/
-    │   └── luohuo-im-server/       ← IM 服务入口
+    ├── luohuo-gateway/luohuo-gateway-server/   ← 网关
+    ├── luohuo-oauth/luohuo-oauth-server/       ← 认证
+    ├── luohuo-ws/luohuo-ws-server/             ← WebSocket
+    ├── luohuo-im/luohuo-im-server/             ← IM 业务
     ├── luohuo-base/
-    ├── luohuo-system/
+    ├── luohuo-system/     ← 不使用（LLM 能力层）
     ├── luohuo-ai/
     └── luohuo-support/
 ```
 
-**⚠️ 关键构建顺序**：`luohuo-util` 是私有工具包，不在 `luohuo-cloud` 的 Maven reactor 中，
-也不在 Maven Central。**必须先单独 install，后续模块才能解析其依赖。**
+**⚠️ 关键构建顺序**：`luohuo-util` 是私有工具包，不在 `luohuo-cloud` 的 Maven reactor 中，也不在 Maven Central。**必须先单独 install，后续模块才能解析其依赖。**
 
 ---
 
-## 四、Docker 镜像构建
+## 四、容器体系
 
-### 4.1 Dockerfile 说明
+当前采用 **Dev 容器编译 + Runtime 容器运行** 两阶段模式。
 
-位置：`infra/docker/hula-server/Dockerfile.runtime`
+### 4.1 Dev 容器：hula-server-dev
 
-```dockerfile
-FROM maven:3.9-eclipse-temurin-21 AS builder
+- 镜像：`maven:3.9-eclipse-temurin-21`（见 `infra/docker/hula-server/Dockerfile.dev`）
+- 启动方式：`sleep infinity`，开发人员 `docker exec` 进入编译
+- 源码挂载：`../../HuLa-Server:/workspace/HuLa-Server`
+- Maven 缓存：Docker volume `maven-cache`
 
-WORKDIR /build
-COPY HuLa-Server /build/HuLa-Server
-
-# ⚠️ 第一步：安装 luohuo-util（必须，否则后续模块依赖解析失败）
-WORKDIR /build/HuLa-Server/luohuo-util
-RUN mvn -B -ntp -DskipTests clean install
-
-# 第二步：构建目标服务
-WORKDIR /build/HuLa-Server/luohuo-cloud
-ARG APP_MODULE=luohuo-gateway/luohuo-gateway-server
-RUN mvn -B -ntp -DskipTests -pl ${APP_MODULE} -am clean package
-
-FROM eclipse-temurin:21-jre
-WORKDIR /app
-ARG APP_MODULE=luohuo-gateway/luohuo-gateway-server
-COPY --from=builder /build/HuLa-Server/luohuo-cloud/${APP_MODULE}/target/*.jar /app/app.jar
-ENV TZ=Asia/Shanghai
-EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "/app/app.jar"]
-```
-
-> **注意**：当前 `Dockerfile.runtime` 尚未包含 luohuo-util 的安装步骤，CI 使用前需先按上述内容更新 Dockerfile（请联系峰哥确认）。
-
-### 4.2 构建命令（每个服务单独构建一个镜像）
-
-CI 需对以下 4 个模块各构建一次，通过 `APP_MODULE` 参数区分：
+**编译命令**（在宿主机执行 `docker exec`）：
 
 ```bash
-# 以下命令在包含 HuLa-Server/ 和 infra/ 目录的根路径执行
+# 1. 先安装 luohuo-util（首次或工具模块有变动时）
+docker exec hula-server-dev bash -lc "
+  cd /workspace/HuLa-Server/luohuo-util
+  mvn clean install -DskipTests -q
+"
 
-# 网关服务
-docker build \
-  --build-arg APP_MODULE=luohuo-gateway/luohuo-gateway-server \
-  -f infra/docker/hula-server/Dockerfile.runtime \
-  -t <registry>/aichat/hula-gateway:${TAG} \
-  .
-
-# 认证服务
-docker build \
-  --build-arg APP_MODULE=luohuo-oauth/luohuo-oauth-server \
-  -f infra/docker/hula-server/Dockerfile.runtime \
-  -t <registry>/aichat/hula-oauth:${TAG} \
-  .
-
-# WebSocket 服务
-docker build \
-  --build-arg APP_MODULE=luohuo-ws/luohuo-ws-server \
-  -f infra/docker/hula-server/Dockerfile.runtime \
-  -t <registry>/aichat/hula-ws:${TAG} \
-  .
-
-# IM 业务服务
-docker build \
-  --build-arg APP_MODULE=luohuo-im/luohuo-im-server \
-  -f infra/docker/hula-server/Dockerfile.runtime \
-  -t <registry>/aichat/hula-im:${TAG} \
-  .
+# 2. 编译 4 个核心服务（约 3-5 分钟）
+docker exec hula-server-dev bash -lc "
+  cd /workspace/HuLa-Server/luohuo-cloud
+  mvn -pl luohuo-gateway/luohuo-gateway-server,luohuo-oauth/luohuo-oauth-server,luohuo-ws/luohuo-ws-server,luohuo-im/luohuo-im-server -am clean package -DskipTests -q
+"
 ```
 
-镜像标签规范（参考 CI 流水线设计文档）：
-- 测试：`test-<shortsha>`（如 `test-a1b2c3d`）
-- 生产：`v<major>.<minor>.<patch>`（如 `v3.0.6`）
+### 4.2 Runtime 容器：hula-server-runtime
 
-### 4.3 增量构建建议
+- 镜像：`eclipse-temurin:21-jre`（见 `infra/docker/hula-server/Dockerfile.runtime`）
+- 容器名：`hula-server-runtime`
+- Profile：`run`（不随 `up-dev.sh` 启动，需单独 `run-runtime.sh`）
+- JAR 来源：从 HuLa-Server workspace **只读挂载**，容器启动时由 `start-runtime.sh` 复制到 `/runtime/jars/`
+- 更新方式：`docker restart hula-server-runtime`（自动取最新编译产物）
 
-4 个服务共用同一套 `luohuo-util` + `luohuo-cloud` 基础代码，差异仅在服务入口模块。
-可通过以下策略减少重复编译：
+**关键 JVM 参数**（在 `start-runtime.sh` 中注入）：
 
-1. 用 Docker BuildKit cache mount 缓存 Maven 本地仓库：
-   ```dockerfile
-   RUN --mount=type=cache,target=/root/.m2 \
-       mvn -B -ntp -DskipTests clean install
-   ```
-2. 只有对应服务模块代码有变动时才触发该服务的 rebuild。
+```bash
+java \
+  -Dluohuo.nacos.ip=nacos \
+  -Dluohuo.nacos.port=8848 \
+  -DNACOS_NAMESPACE=bfa0d426-e281-4da0-b830-c3962ed883d2 \  # Runtime 独立命名空间
+  -Dluohuo.nacos.local-ip=$(hostname -i) \
+  -Dserver.port=18760 \
+  -jar /runtime/jars/gateway.jar
+```
+
+### 4.3 aichat-plugins Dev 容器
+
+- 镜像：`node:24-bookworm`（见 `infra/docker/aichat-plugins/Dockerfile.dev`）
+- 内置 openclaw@latest（AI 引擎网关），启动时 symlink aichat-claw plugin 并运行 openclaw gateway
+- 源码挂载：`../../aichat-plugins:/workspace/aichat-plugins`
+- openclaw gateway Control UI 端口：宿主机 `18790` → 容器 `18789`
 
 ---
 
@@ -361,79 +327,58 @@ curl -X POST $NACOS -d "tenant=$NS&dataId=luohuo-gateway-server.yml&group=DEFAUL
 
 ---
 
-## 六、服务启动配置
+## 六、Runtime 启动与编排
 
-### 6.1 启动命令（关键 JVM 参数）
+### 6.1 启动流程
 
-每个服务镜像的 `ENTRYPOINT` 是 `java -jar /app/app.jar`，运行时需注入以下参数：
+Runtime 容器（`hula-server-runtime`）通过 `start-runtime.sh` 脚本启动全部 4 个服务：
+
+1. 从 workspace 只读挂载复制 JAR 到 `/runtime/jars/`
+2. 按顺序启动：oauth → system（跳過）→ ws → im → gateway
+3. 通过 `tail -F` 持续输出日志保持容器运行
+
+### 6.2 启动命令
 
 ```bash
-java \
-  -Dluohuo.nacos.ip=<nacos-host> \           # Nacos 地址（bootstrap.yml 里是编译期写死的，必须覆盖）
-  -Dluohuo.nacos.port=8848 \
-  -Dluohuo.nacos.local-ip=<本机IP> \          # ⚠️ 服务注册 IP（必须为容器可达 IP，否则网关路由到错误地址）
-  -Dserver.port=<服务端口> \                   # 各服务端口见下表
-  -jar /app/app.jar
+cd /home/hua/projects/backend_workspace/aichat/infra
+
+# 构建镜像（仅首次）
+./scripts/build.sh
+
+# 启动运行环境
+./scripts/run-runtime.sh
+
+# 更新到最新版本（dev 环境编译后）
+docker restart hula-server-runtime
 ```
 
-> ⚠️ `-Dluohuo.nacos.local-ip` 是关键参数。服务向 Nacos 注册时使用此 IP，网关通过 Nacos 获取服务地址后转发请求。
-> 若不设置，默认使用编译期写死的开发者本机 IP（如 `192.168.1.37`），网关将路由到不可达地址。
-> Docker 环境中一般使用 `$(hostname -i)` 获取容器 IP。
-
-| 服务镜像 | `-Dserver.port` |
-|---------|----------------|
-| hula-gateway | 18760 |
-| hula-oauth   | 18761 |
-| hula-ws      | 18762 |
-| hula-im      | 18763 |
-
-### 6.2 Docker Compose 编排参考
+### 6.3 Docker Compose 编排（runtime 部分）
 
 ```yaml
-services:
-  hula-gateway:
-    image: <registry>/aichat/hula-gateway:${TAG}
-    container_name: hula-gateway
-    command: ["java", "-Dluohuo.nacos.ip=nacos", "-Dluohuo.nacos.port=8848", "-Dserver.port=18760", "-jar", "/app/app.jar"]
-    ports:
-      - "18760:18760"
-    depends_on:
-      nacos:
-        condition: service_healthy
-    networks: [aichat-net]
-
-  hula-oauth:
-    image: <registry>/aichat/hula-oauth:${TAG}
-    container_name: hula-oauth
-    command: ["java", "-Dluohuo.nacos.ip=nacos", "-Dluohuo.nacos.port=8848", "-Dserver.port=18761", "-jar", "/app/app.jar"]
-    depends_on:
-      nacos:
-        condition: service_healthy
-    networks: [aichat-net]
-
-  hula-ws:
-    image: <registry>/aichat/hula-ws:${TAG}
-    container_name: hula-ws
-    command: ["java", "-Dluohuo.nacos.ip=nacos", "-Dluohuo.nacos.port=8848", "-Dserver.port=18762", "-jar", "/app/app.jar"]
-    depends_on:
-      nacos:
-        condition: service_healthy
-    networks: [aichat-net]
-
-  hula-im:
-    image: <registry>/aichat/hula-im:${TAG}
-    container_name: hula-im
-    command: ["java", "-Dluohuo.nacos.ip=nacos", "-Dluohuo.nacos.port=8848", "-Dserver.port=18763", "-jar", "/app/app.jar"]
-    depends_on:
-      nacos:
-        condition: service_healthy
-    networks: [aichat-net]
+hula-server-runtime:
+  build:
+    context: ../..
+    dockerfile: infra/docker/hula-server/Dockerfile.runtime
+  container_name: hula-server-runtime
+  volumes:
+    - ../../HuLa-Server:/workspace/HuLa-Server:ro   # 只读挂载，获取编译后的 JAR
+    - runtime-logs:/runtime/logs
+  environment:
+    TZ: Asia/Shanghai
+    NACOS_IP: nacos
+    NACOS_PORT: "8848"
+    NACOS_NAMESPACE: ${HULA_RUNTIME_NAMESPACE:-bfa0d426-e281-4da0-b830-c3962ed883d2}
+  ports:
+    - "${HULA_SERVER_PORT:-18080}:18760"   # 网关对外（前端联调端口）
+  depends_on:
+    nacos:
+      condition: service_healthy
+  restart: on-failure:3
+  profiles: ["run"]
+  networks: [aichat-dev-net]
 ```
 
-> **⚠️ `depends_on: nacos: condition: service_healthy` 是强依赖**。
-> 所有服务必须等 Nacos 健康后启动，否则启动时拉不到配置直接崩溃。
-
-### 6.3 Nacos 健康检查配置（供 Compose 参考）
+### 6.4 Nacos 健康检查配置
 
 ```yaml
   nacos:
@@ -491,7 +436,7 @@ curl -s -o /dev/null -w "%{http_code}" \
 | IM 服务启动崩溃，日志含 `JavaMailSender` bean not found | 邮件配置缺失 | 在 Nacos `common.yml` 补充 `spring.mail.*` |
 | 服务启动但 Nacos 只显示 1 个服务 | 其他服务启动失败但静默退出 | 逐一检查各服务日志尾部 |
 | 网关返回 406 | 对应微服务（oauth/ws/im）未在 Nacos 注册 | 确认 4 个服务都已注册并健康 |
-| Maven 构建失败：`com.luohuo.basic:luohuo-parent` not found | `luohuo-util` 未先 install | 确保 Dockerfile 中先执行 `luohuo-util` 的 `mvn install` |
+| Maven 构建失败：`com.luohuo.basic:luohuo-parent` not found | `luohuo-util` 未先 install | 在 hula-server-dev 容器中先执行 `luohuo-util` 的 `mvn clean install` |
 
 ---
 
