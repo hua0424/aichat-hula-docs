@@ -264,3 +264,95 @@ public void refreshLastMsgId(Long roomId, Long msgId, List<Long> uidList) {
 ## 九、变更范围摘要（给 reviewer 一句话）
 
 仅两处改动：`ContactDao` 新增 1 个 lambdaUpdate 方法，`ChatServiceImpl#sendMsg` 在 `msgHandler.checkAndSaveMsg` 之后插一行 + 1 个 private helper。同事务、只前进、撤回豁免、stream_end 自动覆盖。无 MQ / 配置 / 接口契约改动。
+
+---
+
+## 十、实现修正记录（基于 reviewer 评审 + manager 2026-05-12 18:55 裁决）
+
+reviewer 评审（[ISS-003-review-reviewer.md](ISS-003-review-reviewer.md)）发现 M1 / M2 必修 + E2（manager 升级为 must-fix），实际落地与原 §四 / §五 差异如下：
+
+### M1：放弃 `lambdaUpdate`，改用 `ContactMapper.xml` + `INSERT ... ON DUPLICATE KEY UPDATE`
+
+原方案 §4.1 用 `lambdaUpdate().eq().in().and(w -> w.isNull().or().lt())` —— reviewer 正确指出该写法**只 UPDATE 已存在行**：
+
+- 群成员的 Contact 行如果缺失（§七风险 #2 已记），UPDATE 0 行，永远不会推进
+- 写入路径修复后，拉取路径 `updateContactLastMsgIds` 仍会更新，两条路径会产生竞态
+
+实际落地：复用项目内已有的 `refreshOrCreateActive` 模式，在 `ContactMapper.xml` 新增 `refreshLastMsgId`：
+
+```xml
+<insert id="refreshLastMsgId">
+    INSERT INTO im_contact (room_id, uid, last_msg_id, is_del) VALUES
+    <foreach collection="memberUidList" item="uid" separator=",">
+        (#{roomId},#{uid},#{msgId},0)
+    </foreach>
+    ON DUPLICATE KEY UPDATE
+    last_msg_id = IF(#{msgId} &gt; last_msg_id OR last_msg_id IS NULL, #{msgId}, last_msg_id)
+</insert>
+```
+
+一行 SQL 同时解决：
+- Contact 行不存在 → 自动 INSERT
+- `last_msg_id` 为 NULL → IF 第二个条件命中，写入新值
+- 乱序 msgId 到达 → IF 第一个条件不命中，保留更大值
+- 幂等 + 单调递增，无需额外锁
+
+对应的 `ContactMapper#refreshLastMsgId` 与 `ContactDao#refreshLastMsgId` 方法 + javadoc 已落定。
+
+### M2：`getMemberUidList` 含屏蔽成员 —— **是有意为之**，code 中显式注释
+
+reviewer 正确指出 `groupMemberCache.getMemberUidList(roomId)` 内部调用 `groupMemberDao.getMemberUidList(groupId, null)`（null = 不过滤 `deFriend`），返回列表包含 deFriend=true 的屏蔽成员。
+
+manager 裁决：
+> 屏蔽群的人取消屏蔽后应该能看到屏蔽期间的消息 → 应该推进 `last_msg_id` → 当前行为正确
+
+实际落地：`syncContactLastMsgId` 的 javadoc 显式标注：
+
+```
+群聊使用 GroupMemberCache#getMemberUidList,返回列表【包含 deFriend=true 的屏蔽成员】,
+是有意为之 — 屏蔽者取消屏蔽后应能看到屏蔽期间的消息,故也推进其 last_msg_id。
+被 removeByGroupId 物理删除的踢出成员天然不在列表里。
+```
+
+### E2 / S2：数据异常时**禁止抛异常**，改 `log.warn` + 防御性 return（manager 升级为 must-fix）
+
+原方案 UT-4 注释「可抛 IllegalStateException」错误。reviewer + manager 共识：
+> 在 `@Transactional` 内抛异常会回滚整个 `sendMsg`，导致消息丢失。**必须做防御性返回而不是抛异常。**
+
+实际落地：`syncContactLastMsgId` 对四类异常分别走 `log.warn` + return：
+
+| 检查点 | log 信息 |
+|--------|----------|
+| `roomId == null \|\| msgId == null` | 静默 return |
+| `roomCache.get(roomId) == null` | `room not found` |
+| 群聊 `groupMemberCache.getMemberUidList(roomId)` 空/null | `empty group member list` |
+| 单聊 `roomFriendDao.getByRoomId(roomId) == null` | `room_friend not found` |
+| 其他房间类型（HotRoom 等） | 静默 return |
+
+### S1：调用位置前移到 `checkAndSaveMsg` 之后、`isTemp` 之前
+
+按 reviewer Q2 推荐方案，使核心写入路径线性排列：`save → sync last_msg_id → isTemp → event`。
+
+### I3：`sendMsg` 内加 `TODO(ISS-00X)` 注释标记 Room.last_msg_id skipPush 缺口
+
+注释位于 `SpringUtils.publishEvent` 上方一行，方便后续 issue（已登记为 ISS-005）定位。
+
+### 不在 ISS-003 范围（已登记 follow-up）
+
+| Issue | 内容 | 优先级 |
+|-------|------|--------|
+| **ISS-004** | `refreshOrCreateActiveTime` SQL 无条件覆盖 `last_msg_id`，与同事务写入路径产生并发回退竞态 | P2 |
+| **ISS-005** | `Room.last_msg_id` 在 skipPush=true 路径下不更新，最近会话列表显示错误 | P2 |
+
+### 受影响文件清单（实际）
+
+| 文件 | 改动 |
+|------|------|
+| `ContactMapper.xml` | 新增 `refreshLastMsgId` SQL（INSERT...ON DUPLICATE KEY UPDATE） |
+| `ContactMapper.java` | 新增 `refreshLastMsgId` 方法签名 + javadoc |
+| `ContactDao.java` | 新增 `refreshLastMsgId` 公开方法（`@TenantIgnore`） |
+| `ChatServiceImpl.java` | `sendMsg` 内插一行调用（M1 + S1） + 新增 `syncContactLastMsgId` 私有方法（M2 + E2 + 完整 javadoc） + 一行 TODO 注释（I3） |
+| `teamdocs/shared/风险与问题/问题清单.md` | ISS-003 状态备注更新；新增 ISS-004 / ISS-005 |
+| `teamdocs/shared/风险与问题/ISS-003-写入路径同步last-msg-id方案.md` | 本节增补 |
+
+S1 之外的 should-fix（CC-3 群聊并发用例 / 整体 UT 实现）将在后续 PR 一并补齐，不阻塞主修复合入。
