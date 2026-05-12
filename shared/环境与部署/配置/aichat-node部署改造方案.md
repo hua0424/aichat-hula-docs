@@ -160,7 +160,7 @@ docker exec aichat-plugins-dev bash -lc 'cat > /root/.aichat/config.jsonc <<EOF
 EOF'
 ```
 
-> `claws.openclaw.token` 不需要填：node 端 auto-detect 会从 `/root/.openclaw/openclaw.json` 读 `gateway.auth.token`（[config.ts:119-127](../../../../packages/node/src/config.ts)）。
+> `claws.openclaw.token` **必须显式填上**(2026-05-12 backend-tester 实测发现):虽然 `detectClawConfig` 在 `config.ts:103-136` 准备了 auto-detect,但**当 `claws.openclaw.gatewayUrl` 显式存在时,会走第一个 if 分支直接返回 `token: config.claws.openclaw.token || ''`,跳过 auto-detect**——`packages/node` 的代码缺陷,见 §九。短期 workaround:`config.jsonc` 里同时写 `gatewayUrl` 与 `token`,token 值与 `/root/.openclaw/openclaw.json` 的 `gateway.auth.token` 保持一致。
 
 ### 4.2 取「安洁」激活 Token
 
@@ -269,3 +269,4 @@ docker exec aichat-plugins-dev tail -f /tmp/aichat-node.log
 - [ ] **plugin-dev**（我）：激活流程跑通后，确认日志符合 §4.4 期望；不通则 hotfix；
 - [ ] **server-dev**：复跑冒烟测试 §一 步骤 4-6，更新 ISS-001 至 Closed；
 - [ ] **plugin-dev**：另起 PR 修 `packages/claw/openclaw.plugin.json` 的 `activation.onStartup` 与未来的 `DEFAULT_SERVER_URL` 默认值（不阻塞本次联调）。
+- [ ] **plugin-dev**:修 `packages/node/src/config.ts` `detectClawConfig`——当 `claws.openclaw.gatewayUrl` 显式而 `token` 缺失时,仍需 fallback 到从 `~/.openclaw/openclaw.json` 自动读 `gateway.auth.token`,避免再次出现本次的 workaround(本次联调用 §4.1 的 workaround 绕过)。
