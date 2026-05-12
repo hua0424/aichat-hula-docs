@@ -168,8 +168,8 @@ EOF'
 
 「安洁」(`uid=140789091499520`) 的 aiclaw activation token 来源：
 
-- DB 现状（来自 server-dev 2026-05-12）：`auth_status=0, machine_code=bab0dadf-…`，即 activation token **尚未被 `/activate` 消费**，原明文仍有效。
-- 若明文不在 backend-tester 手上：由 owner（`2439646234@qq.com`）调 `POST /api/im/aiclaw/{uid}/reset-token` 重置后由 server-dev 通过点对点通道下发新 token。
+- DB 现状（server-dev 2026-05-12 已 refresh）：`auth_status=0, machine_code=NULL`，新 activation token 由 server-dev 通过点对点通道（claude-peers `send_message`）发给 backend-tester。
+- 实现说明：服务端控制器路径是 `POST /api/im/aiclaw/{uid}/refresh-activation`,联调文档里的 `reset-token` 是其别名,语义等价（旧 token 作废 → 生成新 token → `auth_status` 回 0 → `machine_code` 清空）。
 
 ### 4.3 跑激活
 
