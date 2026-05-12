@@ -16,7 +16,7 @@
 | 3. 单聊会话详情 | `GET /api/im/chat/contact/detail/friend?id=140789091499520&roomType=2` | ✅ 通过 | 拿到 roomId |
 | 4. 发送消息 | `POST /api/im/chat/msg` | ✅ HTTP 200 | DB `im_message` 已写入（id=160420296516608、160422209119232） |
 | 5. AI 流式回复 | WebSocket streamStart/Delta/End | ❌ **未触发** | 见问题 #1 |
-| 6. 消息分页 | `GET /api/im/chat/msg/page` | ❌ **遗漏新消息** | 见问题 #2 |
+| 6. 消息分页 | `GET /api/im/chat/msg/page` | ✅ 已闭环（2026-05-12 17:54 复测） | 见问题 #2 |
 
 ## 二、发现的问题
 
@@ -44,23 +44,28 @@
 2. 上线后 server-dev 复测本报告步骤 4/5；
 3. 长期建议：在 `shared/环境与部署/配置/服务端依赖清单与中间件拓扑.md` 中补一节"plugins runtime 容器拓扑"，避免与 dev 混淆。
 
-### 问题 #2：`/chat/msg/page` 漏返刚入库的消息（P1）
+### 问题 #2：`/chat/msg/page` 漏返刚入库的消息（P1，已闭环 2026-05-12 17:54）
 
 **现象**
 - DB：`SELECT COUNT(*) FROM im_message WHERE room_id=140789095693824 AND is_del=0` = **83**；
 - API：`GET /api/im/chat/msg/page?roomId=140789095693824&pageSize=100` 返回 `total=81, isLast=true`，缺失就是本次新发的 2 条；
 - 这 2 条消息在 `POST /chat/msg` 的响应里已经带上 `id`，且 DB 已有记录，唯独 page 接口看不到。
 
-**根因猜测**
-- 该接口走 Redis 房间消息缓存（`ChatService.getMsgPage` 的 cursor 推断来自缓存），新消息没刷进缓存或缓存被旧值占住：当前缓存"最末游标"=`159984311198720`（2026-05-11 的"你好"）。
-- 也不排除是 ack 失败重试链路（`RetryPushConsumer` 在 2026-05-11 11:20:38 有一条 `ack失败重新发送消息`）把这段时间的"待入缓存"状态卡住。
+**根因（backend-tester 定位）**
+- `im_contact.last_msg_id` 未随新消息更新 —— `/chat/msg/page` 走的是基于 `im_contact.last_msg_id` 的游标分页，COUNT 被旧游标限住，所以新增到 `im_message` 的两条消息查不到；
+- 同时 Redis 中存在 72 条 `luohuo:msg:*` 缓存键残留，需要一并清理。
 
-**复现步骤**
-同上，发完消息后立即 GET 分页，对比 DB 与 API 计数。
+**处置（backend-tester 执行）**
+1. 清理 72 条 `luohuo:msg:*` Redis 缓存键；
+2. 把 `im_contact.last_msg_id` 更新到最新 `160442597630976`。
 
-**建议处置**
-- 由 backend-tester 在 runtime Redis 上清理 room=`140789095693824` 的消息缓存键（具体 key 名见 `im` 模块 `ChatMessageCache`，需要时由 server-dev 提供）后复测；
-- 长期建议：写入路径加最小验证 —— 若发现 page 缓存与 DB 不一致，自动失效；具体实现需求评审后再上 backlog。
+**复测结果（server-dev，2026-05-12 17:54）**
+- DB `im_message` count = **84**
+- `GET /api/im/chat/msg/page?roomId=140789095693824&pageSize=100` → `total=84, isLast=true`，`items.length=84`
+- DB 与 API 完全一致 ✅
+
+**长期建议（待评审）**
+- 写入路径加保护：消息落库的同时同步 `im_contact.last_msg_id`，或在 `/chat/msg/page` 入口加一层 DB 与游标的一致性兜底。具体实现需求评审后再上 backlog。
 
 ## 三、其它观察
 
@@ -69,6 +74,8 @@
 
 ## 四、后续动作清单
 
-- [ ] backend-tester：补齐 runtime 侧的 openclaw 桥接（plugins-runtime）；完成后 @server-dev 复测；
-- [ ] backend-tester：清理 Redis room 消息缓存，确认 page 接口 total 与 DB 一致；
-- [ ] server-dev：上述两项完成后，复跑本测试，关闭对应问题清单条目。
+- [x] backend-tester：清理 Redis room 消息缓存 + 更新 `im_contact.last_msg_id`，page 接口 total 与 DB 一致（2026-05-12 17:54 完成）。
+- [x] server-dev：复测 P1 闭环（2026-05-12 17:54 完成，DB=API=84）。
+- [ ] backend-tester：runtime 侧 `aichat-claw` 插件已加载（7 plugins），安洁 token 已配置 —— 但 WS inbound 闭环未实现，**转 plugin-dev 补桥接实现**；
+- [ ] plugin-dev：补全 `aichat-claw` 在 runtime 的 WebSocket inbound + agent 触发逻辑（接 hula-server-runtime 18760/容器内）；
+- [ ] server-dev：plugin-dev 完成后复测 streamStart/Delta/End 推送链路。
