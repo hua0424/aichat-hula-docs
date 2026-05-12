@@ -164,19 +164,19 @@ EOF'
 
 ### 4.2 取「安洁」激活 Token
 
-「安洁」(`uid=140789091499520`) 的 aiclaw activation token，目前我（plugin-dev）手上没有，需要 server-dev 或 backend-tester 提供。来源候选：
+> **安全约定：activation token 永远不写入本文档 / 任何 repo**。本节使用占位 `<ACTIVATION_TOKEN>`；真实 token 由 server-dev / owner 通过点对点通道（claude-peers `send_message` 或私聊）发给执行人，落到容器内 `~/.aichat/credentials.jsonc` 后即用即弃。
 
-- 早期由 owner（`2439646234@qq.com`）通过 `POST /api/im/aiclaw/create` 拿到的一次性 token（[联调环境说明 §3.1](../联调/联调环境说明.md)）；
-- 若已过期 / 丢失，由 owner 调用 `POST /api/im/aiclaw/{uid}/reset-token` 重置。
+「安洁」(`uid=140789091499520`) 的 aiclaw activation token 来源：
 
-> **请 server-dev 确认：DB 里 `im_aiclaw.auth_status=1` 是否意味着 activation token 已被换成 connectionToken？如果是这种情况，需要先 reset-token 拿新的 activation token。**
+- DB 现状（来自 server-dev 2026-05-12）：`auth_status=0, machine_code=bab0dadf-…`，即 activation token **尚未被 `/activate` 消费**，原明文仍有效。
+- 若明文不在 backend-tester 手上：由 owner（`2439646234@qq.com`）调 `POST /api/im/aiclaw/{uid}/reset-token` 重置后由 server-dev 通过点对点通道下发新 token。
 
 ### 4.3 跑激活
 
 ```bash
 docker exec aichat-plugins-dev bash -lc '
   cd /workspace/aichat-plugins/packages/node &&
-  node dist/cli.js activate --backend openclaw --token <安洁activationToken>
+  node dist/cli.js activate --backend openclaw --token <ACTIVATION_TOKEN>
 '
 ```
 
@@ -253,7 +253,7 @@ docker exec aichat-plugins-dev tail -f /tmp/aichat-node.log
 
 | # | 内容 | 责任方 | 阻塞? |
 |---|------|--------|------|
-| 1 | 「安洁」activation token 来源（见 §4.2） | server-dev | ✅ 阻塞激活 |
+| 1 | 「安洁」activation token 通过点对点通道下发（不入 repo） | server-dev → backend-tester | ✅ 阻塞激活 |
 | 2 | 是否同意「同容器 supervisor」而非新增 `aichat-node-runtime` service | backend-tester | 否，若不同意我改用新增 service 方案，工作量+1 |
 | 3 | runtime Nacos 命名空间是 `bfa0d426-…-883d2`（与 dev 隔离），node 不进 Nacos 不受影响。**仅核对一下不要被误配。** | backend-tester | 否 |
 | 4 | `~/.aichat/credentials.jsonc` 含 connectionToken（敏感），`aichat-home` 卷不要泄漏到镜像 / 仓库 | backend-tester | 否 |
@@ -264,7 +264,7 @@ docker exec aichat-plugins-dev tail -f /tmp/aichat-node.log
 
 ## 九、后续动作清单
 
-- [ ] **server-dev**：提供 / 重置「安洁」activation token，回贴本文件 §4.2；
+- [ ] **server-dev**：通过 claude-peers 点对点通道把「安洁」activation token 发给 backend-tester（不进任何 repo）；
 - [ ] **backend-tester**：评审 §3 compose diff 并执行（compose 文件在 backend workspace），确认 4.1 / 4.3 步可正常激活；
 - [ ] **plugin-dev**（我）：激活流程跑通后，确认日志符合 §4.4 期望；不通则 hotfix；
 - [ ] **server-dev**：复跑冒烟测试 §一 步骤 4-6，更新 ISS-001 至 Closed；
