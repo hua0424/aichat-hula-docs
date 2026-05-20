@@ -164,6 +164,8 @@ private lastCtx: LastMessageContext | null;
 interface ThinkingSession {
   /** sessionKey: aiclaw-{uid}-room-{roomId} */
   sessionKey: string;
+  /** server 生成的 thinking 记录 ID（START 后由 server 返回） */
+  thinkingId: string;
   /** 触发消息的 msgId */
   triggerMsgId: string;
   /** 思考开始时间戳 */
