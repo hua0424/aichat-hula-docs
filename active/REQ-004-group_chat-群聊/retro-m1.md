@@ -142,9 +142,55 @@ reviewer 已记录到后续 review 检查清单（feedback 已确认）：
 - plugin: MessageHandler 重构 + Adapter 映射 + hula_send_message 扩展 + userType=4 修正
 - frontend: chat.ts thinkingStreams + Mitt 监听 + ThinkingCard + ThinkingPanel
 
-**M2 启动前提**：
-- frontend-dev 完成常量字符串修复
-- backend-tester M1 提测通过
-- 三方确认无其他遗漏
+**M2 启动前提**（全部达成 ✅）：
+- ✅ frontend-dev 完成常量字符串修复（commit `01e152d69`）
+- ✅ backend-tester M1 提测通过
+- ✅ M1-fix 三方完成（server 648030a8/39d6eb98 + plugin 966b5a5 + 设计 v1.3）
+- ✅ backend-tester M1-fix 复测通过
 
-预计 M2 启动时间：常量修复 + 提测完成后立即启动。
+---
+
+## 八、M1 经验沉淀（更新于 2026-05-20）
+
+### 8.1 跨组协议常量值对齐
+
+**问题**：v1.2 评审抓了 payload 嵌套/扁平结构，但**字符串常量值**未列入检查项。
+- server `groupConfigChange` vs plugin `groupConfigUpdate` vs frontend `aiclawGroupConfigUpdate`
+- 编码阶段才发现，靠 plugin-dev 自测捕获
+
+**沉淀**：reviewer 已将以下列入后续检查清单（按其 feedback 确认）：
+- WS 事件类型字符串（Req/Resp 双方向）
+- REST API 路径
+- Redis key 模式
+- Token / extra 字段名
+- DTO 字段名 camelCase vs snake_case
+
+### 8.2 Entity-DB schema 一致性
+
+**问题**：设计文档 §4.1 代码骨架未明确 Entity 继承关系，实现时套用了通用厚重模板：
+- `AiclawThinkingMsgRel` 套用 `SuperEntity` → 与复合主键冲突
+- `AiclawThinking` 套用 `Entity` → 含 DB 不存在的 `updateTime/updateBy`
+
+**沉淀**：
+- 设计文档代码骨架应明确指定 Entity 继承基类（避免实现时套用通用模板）
+- 测试环节优先检查 Entity-DB 字段对应关系（backend-tester 已纳入测试 SOP）
+- 后续里程碑遇到"DB 表结构简单但基类厚重"场景需特别警惕
+
+### 8.3 字段语义只能由权威方填充
+
+**问题**：M1-4 `status: 'complete' | 'error'` 字段。
+- frontend 期望接收，但 server/plugin 原设计未提供
+- 前端基于 errorMsg 推断不健壮（空字符串边界）
+
+**沉淀**：thinking 结束语义只有 server/aichat-node 知道 → 必须由权威方推送。前端的状态字段定义应反向推动上游补齐。
+
+### 8.4 M1-fix 复测结论（2026-05-20 backend-tester）
+
+✅ M1-1：AiclawThinkingMsgRel 改独立 POJO + 自定义 Mapper（insertIgnore / selectMsgIdsByThinkingId）
+✅ M1-2：AiclawThinking 改 SuperEntity，updateTime/updateBy 已移除
+✅ M1-4：WSThinkingEnd 新增 status 字段
+✅ M1-3：plugin protocol fromUid/roomId 改 string | number（与 ReceivedMessage 一致约定）
+
+> 注：因 hula-server-dev 构建容器按资源管理要求已停止，本次未做编译验证。代码变更简单，编译风险极低；如需可临时启动 dev 容器验证，或等 M2 部署时一并确认。
+
+**M1 整体完结。M2 已启动（2026-05-20）。**
