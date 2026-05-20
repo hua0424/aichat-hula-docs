@@ -3,7 +3,7 @@
 > Owner: server-dev  
 > 输入: [需求.md](需求.md) v2.1 + design-tasks.md §2.1  
 > 日期: 2026-05-20  
-> 状态: v1.2（reviewer 评审后修订，M1/S1/S2/S5/I1-I5 全部修复）
+> 状态: v1.3（M1-fix：Entity-DB 对齐 + THINKING_END status 字段）
 
 ---
 
@@ -437,7 +437,8 @@ public class WSThinkingDelta {
 public class WSThinkingEnd {
     private String thinkingId;     // server 生成的 thinking ID
     private Integer durationMs;    // 处理耗时
-    private String error;          // 异常信息（可选）
+    private String status;         // "complete" | "error"（M1-fix 新增）
+    private String error;          // 异常详情，正常结束为空
     private String roomId;         // 可选冗余，方便调试
 }
 
@@ -465,7 +466,8 @@ public class WSThinkingEndResp {
     private String fromUid;
     private String roomId;
     private Integer durationMs;
-    private String error;
+    private String status;         // "complete" | "error"（M1-fix 新增）
+    private String error;          // 异常详情，正常结束为空
 }
 ```
 
