@@ -3,7 +3,7 @@
 > Owner: server-dev  
 > 输入: [需求.md](需求.md) v2.1 + design-tasks.md §2.1  
 > 日期: 2026-05-20  
-> 状态: v1.1（对齐 manager + plugin-dev + frontend-dev 决策后修订）
+> 状态: v1.2（reviewer 评审后修订，M1/S1/S2/S5/I1-I5 全部修复）
 
 ---
 
@@ -130,6 +130,31 @@ CREATE TABLE im_aiclaw_thinking_msg_rel (
 - 联合主键避免重复关联
 - 无单独自增 ID，减少索引开销
 - `create_time` 用于按时间排序关联消息
+
+**回写路径（S5）— 谁在何时写入 thinking_msg_rel：**
+
+```
+aiclaw agent loop 中调用 hula_send_message Tool
+    │ 携带 thinkingId（从 THINKING_START 广播中提取）
+    ▼
+aichat-claw Plugin → REST POST /chat/msg
+    │ Body 包含 { ..., extra: { thinkingId: "xxx" } }
+    ▼
+Server MessageController
+    │ 1. 写入 im_message（正常消息落库）
+    │ 2. 读取 extra.thinkingId
+    │ 3. 写入 im_aiclaw_thinking_msg_rel(thinking_id, msg_id)
+    │ 4. 更新 im_aiclaw_thinking.has_response = 1
+    ▼
+完成：thinking 与消息的关联建立
+```
+
+**与 plugin-dev 对齐点：**
+- `hula_send_message` REST API 的 request body 新增可选字段 `extra?: { thinkingId?: string }`
+- server 收到后识别 `extra.thinkingId`，如存在则执行关联写入
+- 若 thinkingId 为空或不存在，跳过关联（兼容非 thinking 场景的普通消息）
+
+> ⚠️ **待 plugin-dev 确认**：`hula_send_message` schema 是否接受 `extra.thinkingId` 字段？
 
 #### 3.1.4 数据库迁移
 
@@ -278,6 +303,12 @@ Authorization: Bearer {connectionToken}
 - 鉴权层新增 `AiclawTokenAuthenticationFilter`，识别 aiclaw token 并注入 `AiclawAuthentication`
 - 群配置 PUT 接口使用 `@PreAuthorize("hasAiclawPermission(#request.aiclawUid)")` 注解校验
 
+**Token 有效期与刷新机制（I1）：**
+- `connectionToken` 有效期：参考现有用户登录 token 机制（如 7 天）
+- 刷新方式：aichat-node 在 token 过期前调用 `POST /aiclaw/refresh-token` 获取新 token
+- 失效处理：token 过期后 aiclaw 自动进入 standby 状态，待重新激活后恢复
+- 注：具体有效期由现有认证体系决定，设计阶段不单独定义
+
 ---
 
 ### 3.3 WS 事件设计
@@ -323,37 +354,61 @@ public enum WSRespTypeEnum {
 
 ```
 plugins (aichat-node)
-    │ WS THINKING_START(20)
+    │ WS THINKING_START(20) { fromUid, roomId, triggerMsgId }
     ▼
 ┌─────────────────┐
 │ WebSocketHandler │ 接收 WS 消息
 │ (现有 Handler)   │
 └────────┬────────┘
-         │ 根据 type=20/21/22 分发
+         │
          ▼
+┌──────────────────────────────────────────────────────────┐
+│ ThinkingStart Handler                                    │
+│ 1. 【频率校验】Redis 检查 rate limit，超限 → 直接返回      │
+│    thinkingEnd { error: "rate_limit_exceeded" } 给 plugin │
+│    （不创建 thinking 记录，不触发 adapter.chat()）        │
+│ 2. 创建 thinking 记录（落库），生成 thinkingId            │
+│ 3. 广播 thinkingStart { thinkingId, fromUid, ... }        │
+│    到群内所有成员（含该 aiclaw 自己）                      │
+└────────────────────────┬─────────────────────────────────┘
+                         │
+         ┌───────────────┼───────────────┐
+         ▼               ▼               ▼
+    群成员A(前端)   群成员B(前端)   群成员C(aiclaw=fromUid)
+         │               │               │
+         │               │               ▼
+         │               │    plugin 匹配 fromUid === selfUid
+         │               │    提取 thinkingId 存入 session
+         │               │               │
+         │               │               ▼
+         │               │    DELTA/END 携带 thinkingId
+         │               │               │
+         ▼               ▼               ▼
 ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│ ThinkingStart   │     │ ThinkingDelta   │     │ ThinkingEnd     │
-│ Handler         │     │ Handler         │     │ Handler         │
-│                 │     │                 │     │                 │
-│ 1. 创建 thinking│     │ 1. 追加 content │     │ 1. 回填 duration│
-│    记录（落库）  │     │ 2. 广播 DELTA   │     │ 2. 标记完成     │
-│ 2. 广播 START   │     │    到群成员     │     │ 3. 广播 END     │
-│    到群成员     │     │                 │     │    到群成员     │
-└─────────────────┘     └─────────────────┘     └─────────────────┘
-         │                       │                       │
-         └───────────────────────┼───────────────────────┘
-                                 ▼
-                    PushService.sendPushMsg()
-                                 │
-                    ┌────────────┼────────────┐
-                    ▼            ▼            ▼
-                群成员A       群成员B       群成员C
-                (含前端)      (含前端)      (aiclaw)
+│ 前端展示        │     │ 前端展示        │     │ ThinkingDelta   │
+│ thinking 状态条 │     │ thinking 状态条 │     │ /End Handler    │
+└─────────────────┘     └─────────────────┘     │ 1. 追加/结束    │
+                                                │ 2. 广播到群成员 │
+                                                └─────────────────┘
 ```
 
 **推送路由（推送给谁）：**
 - THINKING_START/DELTA/END 推送给群内**所有在线成员**（包括人类用户和其他 aiclaw）
-- 每个事件 payload 携带 `aiclawUid` 字段，供前端区分是哪个 aiclaw 的 thinking
+- 每个事件 payload 携带 `fromUid` 字段，供前端区分是哪个 aiclaw 的 thinking
+
+**thinkingId 回传机制（S1）：**
+- THINKING_START 是 plugin→server 单向请求，server 生成 thinkingId 后无法直接回传给 plugin
+- **方案**：server 将 thinkingId 放入 thinkingStart **广播 payload**（server→client 方向），群内所有成员（含该 aiclaw 自己）都能收到
+- plugin 侧收到 thinkingStart 后，通过匹配 `fromUid === selfUid` 识别是自己的 session，从中提取 `thinkingId`
+- 后续 THINKING_DELTA/END 的入参携带该 `thinkingId`，server 通过 thinkingId 反查 roomId 和 thinking 记录
+
+**频率校验前置（S2）：**
+- THINKING_START Handler 中**优先执行频率校验**（Redis 滑动窗口计数器）
+- 若超限，不创建 thinking 记录、不触发后续 agent loop，直接返回 `THINKING_END` 错误事件给该 aiclaw：
+  ```json
+  { "type": 22, "data": { "thinkingId": null, "error": "rate_limit_exceeded" } }
+  ```
+- 此举避免 agent loop 启动后（GPU/CPU 消耗）才发现被限流，与 plugin-dev 的 AntiLoopGuard 配合形成双层过滤
 
 **DTO 设计：**
 
@@ -426,14 +481,21 @@ public class WSThinkingEndResp {
 ```java
 @Data
 public class WSGroupConfigChange {
-    private Long aiclawUid;       // 哪个 aiclaw 的配置变了
-    private Long roomId;
-    private Integer rateLimitPerMinute;
-    private Integer mentionRequired;
-    private Integer dailyLimit;
-    private Integer respondToAi;
+    private String aiclawUid;       // 哪个 aiclaw 的配置变了
+    private String roomId;
+    private ConfigDTO config;
+
+    @Data
+    public static class ConfigDTO {
+        private Integer rateLimitPerMinute;
+        private Integer mentionRequired;
+        private Integer dailyLimit;
+        private Integer respondToAi;
+    }
 }
 ```
+
+> 注：与 plugin-dev / frontend-dev 对齐，采用嵌套结构 `config: { ... }`，便于前端直接替换配置对象。
 
 推送目标：
 - 群内所有在线成员的客户端（frontend 刷新配置展示）
@@ -450,18 +512,36 @@ public class WSGroupConfigChange {
 **实现：**
 
 ```java
-// ChatMessageResp.Message 新增 extra 字段
+// ChatMessageResp.Message 新增 extra 字段（仅 WS payload，不落库）
 @Data
 public static class Message {
-    // ... 现有字段 ...
+    // ... 现有字段（id, roomId, sendTime, type, body, messageMarks）...
     private Map<String, Object> extra;  // 扩展字段，autoReply 放在里面
 }
 ```
 
+**autoReply 在 WS payload 中的层级位置（I3 明确）：**
+- `extra` 是 `ChatMessageResp.Message` 的**顶层字段**（与 `body`、`messageMarks` 同级）
+- 不是放在 body 内部
+- 示例：
+  ```json
+  {
+    "fromUser": { "uid": "10001" },
+    "message": {
+      "id": "12345",
+      "roomId": "30001",
+      "type": 1,
+      "body": { "content": "触发频率限制，本分钟内无法回复" },
+      "extra": { "autoReply": true, "reason": "rate_limit" }
+    }
+  }
+  ```
+
 **边界说明：**
 1. `im_message` 表零改动（不存储 extra）
-2. autoReply 仅用于实时防循环，历史消息无需追溯
-3. 限流说明消息**不计入**限流统计
+2. `extra` 字段仅在 WS 推送时存在，REST API 返回的消息 JSON 中也可能包含（用于 MCP Tool 调用场景）
+3. autoReply 仅用于实时防循环，历史消息无需追溯
+4. 限流说明消息**不计入**限流统计
 
 > ✅ **跨组对齐（X2）已确认**：server-dev + plugin-dev + frontend-dev 三方一致。
 
@@ -544,6 +624,8 @@ WHERE from_uid = #{aiclawUid}
 ### 3.5 缓存设计
 
 #### 3.5.1 Redis Key 设计
+
+> I4：Redis key 分隔符统一使用英文冒号 `:`，uid/roomId 等变量值中**不应出现冒号**。若业务值可能含冒号，使用 `String.join(":", prefix, uid, roomId)` 前先对值做校验或转义。
 
 ```
 # 群级配置缓存
@@ -755,7 +837,7 @@ public class ThinkingEventHandler {
 |------|------|------|---------|
 | 高频群 COUNT(*) 性能问题 | 🔶 中 | 防循环 SQL 慢查询 | 切换为 Redis 滑动窗口计数器，DB 仅做对账 |
 | 多 aiclaw 并发 thinking 串流 | 🔶 中 | 前端显示混乱 | thinking WS payload 必须含 `aiclawUid`，前端按 uid 隔离 thinking 状态 |
-| 新表 DDL 执行失败 | 🟢 低 | 部署阻塞 | Liquibase 支持回滚；灰度环境先验证 |
+| 新表 DDL 执行失败 | 🟢 低 | 部署阻塞 | 手动 SQL 文件在灰度环境先验证；执行前备份 |
 | aiclaw 自动入群误判 | 🟢 低 | 非 aiclaw 被自动入群 | 查询 aiclaw 列表时加 Redis 缓存 + DB 双校验 |
 | thinking content 过大 | 🟢 低 | TEXT 字段存储压力 | 设置 content 上限（如 64KB），超限截断 |
 
@@ -765,7 +847,7 @@ public class ThinkingEventHandler {
 
 | 子任务 | 工作量 | 说明 |
 |--------|--------|------|
-| **DDL + Liquibase 迁移** | 0.5d | 3 张表 + 索引 + 迁移脚本 |
+| **DDL + SQL 文件** | 0.5d | 3 张表 + 索引 + docs/sql/ 脚本 |
 | **Entity + Mapper + Service 骨架** | 0.5d | MyBatis-Plus 生成 3 套 |
 | **aiclaw 自动入群改造** | 0.5d | addMember 条件分支 + aiclaw 列表查询 |
 | **群配置 REST API** | 1d | CRUD + 权限校验 + Redis 缓存 + WS 通知 |
