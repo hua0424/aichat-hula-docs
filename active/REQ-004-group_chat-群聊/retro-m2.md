@@ -106,7 +106,13 @@ D1 决策落地。`isAiclawSession || (isGroup && hasAiclawInGroup)` 双分支�
 | 字段语义由权威方填充 | ✅ status 字段由 plugin → server 路径完整 |
 | 每天开工前必拉 teamdocs | ⚠️ plugin-dev 自测时短暂误判（design-server v1.3 已加 status 但其本地未拉最新），及时纠正 |
 
-**沉淀**：自测时如发现"设计未提及但应该有的字段"，第一步先 `git pull` 排除文档不同步问题，第二步再上报。
+**沉淀 1**：自测时如发现"设计未提及但应该有的字段"，第一步先 `git pull` 排除文档不同步问题，第二步再上报。
+
+**沉淀 2（M2 提测踩坑）**：M1-fix 复测时 backend-tester 提到"代码变更简单无新增依赖，编译风险极低；如需可临时启动 dev 容器验证"，但**未实际编译**。M2 提测时立即踩到 Lombok `@Builder` vs `SuperEntity` 父类 id 字段不兼容的编译错误（`ThinkingService.create().id(thinkingId)` 编译失败）。
+
+→ **规则**：今后涉及 **Entity 基类切换** 的修复（如 `Entity` ↔ `SuperEntity` ↔ 独立 POJO），**强制走一次实际编译验证**，不依赖"风险评估"。代价小（一次 Maven 编译），收益大（避免下一阶段提测被阻塞）。
+
+修复：server-dev commit `b4ed3241`，`.id(thinkingId)` 链式调用拆成 `build()` 后 `setId(thinkingId)`。
 
 ---
 
