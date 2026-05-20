@@ -2,7 +2,7 @@
 
 > 编写：frontend-dev
 > 日期：2026-05-20
-> 版本：v1.2（reviewer 评审通过，仅 1 处笔误修正）
+> 版本：v1.3（M2 回顾后微调 status 字段注释）
 > 输入：需求.md v2.1 + feasibility-frontend.md + design-tasks.md §2.3 + manager D1-D4 决策 + server-dev/plugin-dev 跨组对齐
 > 关联：design-server.md (server-dev) / design-plugin.md (plugin-dev)
 >
@@ -143,7 +143,7 @@ export type ThinkingEndPayload = {
   roomId: number
   /** 处理耗时（毫秒） */
   durationMs?: number
-  /** 结束状态 */
+  /** 结束状态（由 server 推送，server/plugin v1.3 已对齐） */
   status: 'complete' | 'error'
   /** 错误信息（status=error 时） */
   errorMsg?: string
