@@ -3,7 +3,7 @@
 > Owner: server-dev  
 > 输入: [需求.md](需求.md) v2.1 + design-tasks.md §2.1  
 > 日期: 2026-05-20  
-> 状态: 初稿
+> 状态: v1.1（对齐 manager + plugin-dev + frontend-dev 决策后修订）
 
 ---
 
@@ -131,28 +131,30 @@ CREATE TABLE im_aiclaw_thinking_msg_rel (
 - 无单独自增 ID，减少索引开销
 - `create_time` 用于按时间排序关联消息
 
-#### 3.1.4 Liquibase 迁移
+#### 3.1.4 数据库迁移
 
-迁移文件位置：`luohuo-cloud/luohuo-im/luohuo-im-biz/src/main/resources/db/changelog/`
+项目当前**不使用 Liquibase / Flyway**，数据库变更通过 `docs/sql/` 目录下的手动 SQL 文件管理。
 
-新增文件：`changelog-2026-05-20-REQ-004.xml`
+**新增文件**：`docs/sql/im_aiclaw_group_chat.sql`
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<databaseChangeLog ...>
-    <changeSet id="REQ-004-001" author="server-dev">
-        <createTable tableName="im_aiclaw_group_config">...</createTable>
-    </changeSet>
-    <changeSet id="REQ-004-002" author="server-dev">
-        <createTable tableName="im_aiclaw_thinking">...</createTable>
-    </changeSet>
-    <changeSet id="REQ-004-003" author="server-dev">
-        <createTable tableName="im_aiclaw_thinking_msg_rel">...</createTable>
-    </changeSet>
-</databaseChangeLog>
+```sql
+-- REQ-004 aiclaw 群聊扩展表
+-- 创建日期：2026-05-20
+
+CREATE TABLE IF NOT EXISTS `im_aiclaw_group_config` (
+  ...
+);
+
+CREATE TABLE IF NOT EXISTS `im_aiclaw_thinking` (
+  ...
+);
+
+CREATE TABLE IF NOT EXISTS `im_aiclaw_thinking_msg_rel` (
+  ...
+);
 ```
 
-> ⚠️ **待 manager 决策**：项目当前使用 Liquibase 还是 Flyway？luohuo-im 模块下是否已有迁移文件目录？
+> 注：参考现有 `docs/sql/im_aiclaw.sql` 格式和命名规范。
 
 ---
 
@@ -253,14 +255,28 @@ public class AiclawGroupConfigResp {
 }
 ```
 
-#### 3.2.3 鉴权：aiclaw token
+#### 3.2.3 鉴权：aiclaw 独立 token
 
-群配置接口的鉴权沿用现有 JWT 体系：
-- 请求 Header 携带 `Authorization: Bearer {token}`
-- token 中解析出当前登录用户 uid
-- 校验该 uid 是否为 `aiclawUid` 的 owner
+群配置接口支持**aiclaw 独立 token**鉴权（不依赖主人 token）：
 
-> ⚠️ **待 manager 决策（X4）**：aiclaw-claw / aichat-node 调用群配置接口时，是使用主人的 token 还是独立的 aiclaw token？如果是后者，需要在鉴权层新增 aiclaw token 校验逻辑。
+**Token 解析链路：**
+```
+Authorization: Bearer {connectionToken}
+    → 解析出 aiclawUid
+    → 查 im_aiclaw 获取 owner_uid
+    → 校验：调用者 uid == owner_uid 或 调用者 uid == aiclawUid
+```
+
+**权限矩阵：**
+| 接口 | 主人 | aiclaw 本人 | 其他群成员 |
+|------|------|------------|-----------|
+| GET /aiclaw/group/config | ✅ | ✅ | ✅（只读） |
+| PUT /aiclaw/group/config | ✅ | ✅ | ❌ |
+
+**实现要点：**
+- aichat-node 的 `connectionToken`（activate 流程获取）即为 aiclaw token
+- 鉴权层新增 `AiclawTokenAuthenticationFilter`，识别 aiclaw token 并注入 `AiclawAuthentication`
+- 群配置 PUT 接口使用 `@PreAuthorize("hasAiclawPermission(#request.aiclawUid)")` 注解校验
 
 ---
 
@@ -341,50 +357,60 @@ plugins (aichat-node)
 
 **DTO 设计：**
 
+> 与 plugin-dev / frontend-dev 对齐定稿：WS payload 中消息 ID 统一使用 **String**（与现有 `ChatMessageResp.Message.id` 风格一致），Entity 中仍为 Long。
+
 ```java
-// WSReqTypeEnum 20 → 入参
+// WSReqTypeEnum 20 → 入参（plugin → server）
 @Data
 public class WSThinkingStart {
-    private Long fromUid;        // aiclaw uid
-    private Long roomId;
-    private Long triggerMsgId;   // 触发消息 ID
+    private String fromUid;        // aiclaw uid
+    private String roomId;
+    private String triggerMsgId;   // 触发消息 ID
 }
 
-// WSReqTypeEnum 21 → 入参
+// WSReqTypeEnum 21 → 入参（plugin → server）
 @Data
 public class WSThinkingDelta {
-    private String chunk;        // 增量内容
-    private Integer seq;         // 序号（用于顺序校验）
+    private String thinkingId;     // server 生成的 thinking ID
+    private String chunk;          // 增量内容
+    private Integer seq;           // 序号（用于顺序校验）
+    private String roomId;         // 可选冗余，方便调试
 }
 
-// WSReqTypeEnum 22 → 入参
+// WSReqTypeEnum 22 → 入参（plugin → server）
 @Data
 public class WSThinkingEnd {
-    private Integer durationMs;  // 处理耗时
+    private String thinkingId;     // server 生成的 thinking ID
+    private Integer durationMs;    // 处理耗时
+    private String error;          // 异常信息（可选）
+    private String roomId;         // 可选冗余，方便调试
 }
 
-// WSRespTypeEnum → 响应
+// WSRespTypeEnum → 响应（server → client）
 @Data
 public class WSThinkingStartResp {
-    private Long aiclawUid;
-    private Long roomId;
-    private Long triggerMsgId;
-    private Long thinkingId;     // server 生成的 thinking 记录 ID
+    private String thinkingId;     // server 生成的 thinking ID（THINKING_START 创建后回传）
+    private String fromUid;        // aiclaw uid
+    private String roomId;
+    private String triggerMsgId;
 }
 
 @Data
 public class WSThinkingDeltaResp {
-    private Long aiclawUid;
-    private Long roomId;
+    private String thinkingId;
+    private String fromUid;
+    private String roomId;
     private String chunk;
     private Integer seq;
 }
 
 @Data
 public class WSThinkingEndResp {
-    private Long aiclawUid;
-    private Long roomId;
+    private String thinkingId;
+    private String fromUid;
+    private String roomId;
     private Integer durationMs;
+    private String error;
 }
 ```
 
@@ -415,28 +441,29 @@ public class WSGroupConfigChange {
 
 #### 3.3.4 autoReply 字段载体
 
-**方案对比：**
+**Manager 决策：采用 extra 包裹方案（WS payload only，不落库）**
 
-| 方案 | 载体 | 优点 | 缺点 |
-|------|------|------|------|
-| A | `im_message.extra` (JSON) | 落库可追溯，历史消息可查 | 改动 im_message 结构（虽然 extra 已存在？） |
-| B | 仅 WS payload | 零 DB 改动，轻量 | 历史消息无法区分 autoReply |
+- aichat-node 调用 `hula_send_message` REST API 时传 `extra: { autoReply: true, reason: "rate_limit" }`
+- server 接收后**不落库**，仅在 WS 推送时透传到 payload
+- 前端通过 `extra.autoReply` 识别并跳过触发 agent loop
 
-**推荐方案 B（仅 WS payload）**，理由：
-1. 需求明确 `im_message` 表零改动
-2. autoReply 标记仅用于实时防循环，无需历史追溯
-3. 减少 DB 存储开销
+**实现：**
 
 ```java
-// WS 消息 payload 扩展
+// ChatMessageResp.Message 新增 extra 字段
 @Data
-public class WSMessage {
+public static class Message {
     // ... 现有字段 ...
-    private Boolean autoReply;   // 新增，可选，null = false
+    private Map<String, Object> extra;  // 扩展字段，autoReply 放在里面
 }
 ```
 
-> ⚠️ **跨组对齐（X2）**：请 plugin-dev / frontend-dev 确认 — autoReply 仅 WS payload 是否满足需求？
+**边界说明：**
+1. `im_message` 表零改动（不存储 extra）
+2. autoReply 仅用于实时防循环，历史消息无需追溯
+3. 限流说明消息**不计入**限流统计
+
+> ✅ **跨组对齐（X2）已确认**：server-dev + plugin-dev + frontend-dev 三方一致。
 
 ---
 
@@ -444,41 +471,45 @@ public class WSMessage {
 
 #### 3.4.1 频率限制（10 条/分钟）
 
-**统计 SQL：**
+**主校验：Redis 滑动窗口计数器**
+
+```
+Key: im:aiclaw:rate:{aiclawUid}:{roomId}:{yyyyMMddHHmm}  → int
+TTL: 2min
+```
+
+每次发言时 INCR，查询时累加最近 2 个 bucket。
+
+**兜底：DB 对账（非实时，低频）**
 
 ```sql
--- 查询指定 aiclaw 在最近 1 分钟内的发言数量
+-- 日终对账用，不作为实时校验
 SELECT COUNT(*) FROM im_message
 WHERE from_uid = #{aiclawUid}
   AND room_id = #{roomId}
-  AND type = 1  -- TEXT
+  AND type = 1
   AND create_time >= DATE_SUB(NOW(), INTERVAL 1 MINUTE)
   AND is_del = 0;
 ```
 
-**索引设计：**
-
-```sql
--- 已有 im_message 索引基础上，建议新增复合索引
-ALTER TABLE im_message ADD INDEX idx_from_room_time (from_uid, room_id, create_time);
-```
-
-**性能考量：**
-- 高频群（如 1000 人、每秒多条消息）下，`COUNT(*)` 可能触发全索引扫描
-- **优化方案**：使用 Redis 滑动窗口计数器替代 SQL COUNT
-  - Key: `aiclaw:msg:count:{aiclawUid}:{roomId}:{minute_bucket}`
-  - 每分钟一个 bucket，TTL 2 分钟
-  - 查询时累加最近 2 个 bucket
-
-> ⚠️ **跨组对齐（X3）**：频率/日限统计由 server DB 层做权威，还是 Redis 计数器做权威？
-> - 建议：Redis 做实时校验（高性能），DB 做日终对账（权威性）
+**索引策略：**
+- **不加 im_message 新索引**（保护高频写入表性能）
+- 如需对账，利用现有 `idx_from_uid`（如有）或全表扫描（日终低频可接受）
 
 #### 3.4.2 每日上限（1000 条）
 
-**统计方式：**
+**主校验：Redis 日计数器**
+
+```
+Key: im:aiclaw:daily:{aiclawUid}:{roomId}:{yyyyMMdd}  → int
+TTL: 25h
+```
+
+每日一个 bucket，每次发言 INCR，达到阈值拒绝。
+
+**兜底：DB 对账**
 
 ```sql
--- 按天统计
 SELECT COUNT(*) FROM im_message
 WHERE from_uid = #{aiclawUid}
   AND room_id = #{roomId}
@@ -486,11 +517,6 @@ WHERE from_uid = #{aiclawUid}
   AND DATE(create_time) = CURDATE()
   AND is_del = 0;
 ```
-
-**优化方案（Redis）：**
-- Key: `aiclaw:msg:daily:{aiclawUid}:{roomId}:{yyyyMMdd}`
-- 每日一个 bucket，TTL 25 小时
-- 每次发言 INCR，达到阈值时拒绝
 
 #### 3.4.3 限流触发后的响应
 
@@ -576,19 +602,14 @@ public void updateConfig(AiclawGroupConfigUpdateReq req) {
 
 ---
 
-### 3.6 待澄清问题
+### 3.6 已关闭问题
 
-#### F1. 上下文窗口策略（默认最近 50 条）
+#### F1. 上下文窗口策略（默认最近 50 条）— ❌ 不需要 server 提供
 
-**选项：**
-- A. **server 提供**：新增 `GET /message/context?roomId={}&limit=50` 接口，node 按需拉取
-- B. **node 自行维护**：node 在内存中维护群消息缓冲区，server 只负责推送新消息
-
-**推荐 A（server 提供）**：
-- 理由：node 重启/扩缩容时内存缓冲会丢失，server 作为消息权威源更可靠
-- 实现：复用现有消息分页查询接口，增加 `limit` 参数
-
-> ⚠️ **跨组对齐（X6）**：请 plugin-dev 确认上下文窗口获取方式偏好。
+**结论（plugin-dev 排查后）**：
+- openclaw gateway 通过 sessionKey 自身维护 conversation history
+- aichat-node 不需要传上下文，openclaw 内部处理
+- **server 不需要提供上下文查询 API**，节省 ~0.5d 工作量
 
 ---
 
@@ -717,14 +738,14 @@ public class ThinkingEventHandler {
 
 ## 五、跨组对齐项结论
 
-| 编号 | 议题 | server 端立场 | 状态 |
-|------|------|---------------|------|
-| X1 | THINKING WS payload 字段 | payload 含 `aiclawUid`, `roomId`, `triggerMsgId`, `seq`, `durationMs`；server 生成 `thinkingId` 回传 | 待 plugin-dev 确认 |
-| X2 | autoReply 载体 | **推荐仅 WS payload**（`WSMessage.autoReply: boolean`），不改动 im_message | 待 plugin-dev / frontend-dev 确认 |
-| X3 | 防循环分层 | server 提供 DB 权威层（频率/日限 SQL + Redis 缓存），aichat-node 做内存层（互触发/短回复/退避） | 待 plugin-dev 确认 |
-| X4 | aichat-claw Token 上下文 | 群配置接口沿用现有 JWT；MCP Tool 调用如需独立 token，建议新增 aiclaw token 校验逻辑 | 待 plugin-dev 确认 |
-| X5 | 群配置 WS 通知 payload | `WSGroupConfigChange` 含全部配置字段，推送群内所有在线成员 | 待 plugin-dev / frontend-dev 确认 |
-| X6 | 上下文窗口归属 | **推荐 server 提供**（复用消息查询接口），node 按需拉取 | 待 plugin-dev 确认 |
+| 编号 | 议题 | 结论 | 状态 |
+|------|------|------|------|
+| X1 | THINKING WS payload 字段 | payload 含 `fromUid`/`thinkingId`/`roomId`/`triggerMsgId`/`seq`/`durationMs`/`error?`；WS 中 ID 统一 String 类型 | ✅ 已对齐 |
+| X2 | autoReply 载体 | **extra 包裹方案**（`extra: { autoReply: true }`），WS payload only，不落库 | ✅ 已对齐 |
+| X3 | 防循环分层 | server 提供 Redis 计数器（频率/日限）+ DB 对账；aichat-node 做内存层（互触发/短回复/退避） | ✅ 已对齐 |
+| X4 | aichat-claw Token 上下文 | aiclaw 独立 token（`connectionToken`）鉴权；群配置 PUT 校验 owner/aiclaw 本人 | ✅ 已对齐 |
+| X5 | 群配置 WS 通知 payload | `WSGroupConfigChange` 含全部配置字段，推送群内**所有在线成员** + aichat-node | ✅ 已对齐 |
+| X6 | 上下文窗口归属 | **不需要 server 提供**，openclaw 自身维护 conversation history | ✅ 已关闭 |
 
 ---
 
@@ -751,11 +772,12 @@ public class ThinkingEventHandler {
 | **THINKING WS 协议层** | 1d | Enum 扩展 + 3 个 Handler + DTO + 落库 |
 | **thinking_msg_rel 关联** | 0.5d | MCP Tool 消息回写关联 |
 | **XXL-Job 清理任务** | 0.5d | 定时清理 + 调度中心配置 |
-| **防循环 DB 层** | 0.5d | SQL + Redis 计数器 + 限流响应协议 |
-| **autoReply 标记透传** | 0.3d | WS payload 扩展 |
+| **防循环 DB 层** | 0.5d | Redis 计数器 + 限流响应协议（不加 DB 索引） |
+| **autoReply 标记透传** | 0.3d | WS payload extra 扩展 |
+| **aiclaw token 鉴权** | 0.5d | 新增鉴权 Filter + 权限注解 |
 | **联调测试** | 1.5d | E2E 含多 aiclaw 并发 |
 | **设计评审修订** | 0.5d | 按 reviewer 意见调整 |
-| **合计** | **~7d** | 开发阶段（不含本设计阶段） |
+| **合计** | **~6.5d** | 开发阶段（不含本设计阶段） |
 
 ---
 
