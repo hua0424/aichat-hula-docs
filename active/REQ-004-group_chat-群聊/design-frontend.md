@@ -2,9 +2,18 @@
 
 > 编写：frontend-dev
 > 日期：2026-05-20
-> 版本：v1.0（初稿）
-> 输入：需求.md v2.1 + feasibility-frontend.md + design-tasks.md §2.3
+> 版本：v1.2（reviewer 评审通过，仅 1 处笔误修正）
+> 输入：需求.md v2.1 + feasibility-frontend.md + design-tasks.md §2.3 + manager D1-D4 决策 + server-dev/plugin-dev 跨组对齐
 > 关联：design-server.md (server-dev) / design-plugin.md (plugin-dev)
+>
+> v1.0 → v1.1 变更日志：
+> - D1：私聊 AI 助理本期也切换为 ThinkingPanel（+0.3 天）
+> - D2：extra 字段放在 MsgType 顶层（server-dev 已确认）
+> - D3：@ 触发选项本期完整实现，UI 不 disabled
+> - D4：归档延迟保持 30s
+> - thinkingId 改为 server 生成（Long 自增主键），前端接收 String
+> - X2：autoReply 不入库，仅在 WS payload 携带（前端从 WS 事件检查，不从 MsgType.extra 检查）
+> - X5：群配置 WS 通知推送范围改为群内所有在线成员 + aichat-node
 
 ---
 
@@ -100,7 +109,7 @@ AICLAW_GROUP_CONFIG_UPDATE = 'aiclawGroupConfigUpdate',
 
 /** 思考开始 payload（server → client） */
 export type ThinkingStartPayload = {
-  /** 思考会话 ID（由 aichat-node 生成，全局唯一） */
+  /** 思考会话 ID（由 server 生成，im_aiclaw_thinking 自增主键序列化为 string） */
   thinkingId: string
   /** aiclaw 用户 ID */
   fromUid: number
@@ -163,8 +172,8 @@ export type AiclawGroupConfig = {
 }
 ```
 
-**X1 跨组对齐说明**：
-- `thinkingId`：由 aichat-node 生成（格式建议 `think-{aiclawUid}-{roomId}-{timestamp}`），确保同一 aiclaw 同一 room 同时只有一个 thinking session
+**X1 跨组对齐结论（v1.1 已修正）**：
+- `thinkingId`：由 **server 生成**（`im_aiclaw_thinking` 自增主键），前端接收为 `string` 类型（Long → 字符串，避免 JS 精度问题，与现有 `ChatMessageResp.Message.id` 风格一致）。aichat-node 发送 THINKING_START_REQ 时不携带 thinkingId，server 生成后通过 THINKING_START 响应回传
 - `fromUid` / `roomId`：与现有 `StreamStartPayload` 保持一致
 - `aiclawName` / `aiclawAvatar`：由 server 从 `im_user` / `im_aiclaw` 表回填，减少前端二次查询。若 server 不便回填，前端从 `groupStore.getUserInfo(fromUid)` 获取（降级方案）
 - `triggerMsgId`：可选字段，用于 UI 中 "由 xxx 消息触发" 的展示
@@ -460,8 +469,14 @@ useMitt.on(WsResponseMessageType.THINKING_END, (data: ThinkingEndPayload) => {
 })
 
 useMitt.on(WsResponseMessageType.AICLAW_GROUP_CONFIG_UPDATE, (data: AiclawGroupConfigUpdatePayload) => {
-  // 刷新本地配置缓存（详见 §3.5）
+  // 刷新本地配置缓存
   chatStore.updateAiclawGroupConfig(data.aiclawUid, data.roomId, data.config)
+
+  // 非主人的群成员：展示配置变更提示（X5：推送范围为群内所有在线成员）
+  if (!isAiclawOwner(data.aiclawUid)) {
+    const aiclawName = chatStore.getAiclawName(data.aiclawUid) || 'AI'
+    window.$message?.info(t('aiclaw.group_settings.config_changed', { name: aiclawName }), { duration: 5000 })
+  }
 })
 ```
 
@@ -697,16 +712,10 @@ watch(
 </div>
 ```
 
-**修改后**：
+**修改后**（v1.1 — D1 决策：群聊+私聊均切换为 ThinkingPanel）：
 ```vue
-<!-- AI 助理区域：Thinking 面板（群聊） 或 原有 notice 条（私聊 1v1） -->
-<ThinkingPanel v-if="isGroup && hasAiclawInGroup" />
-<div v-else-if="isAiclawSession" class="flex-shrink-0 px-12px pt-6px">
-  <div class="flex items-center gap-6px px-12px py-6px rounded-6px bg-#7c5cfc10 text-(12px #7c5cfc)">
-    <svg class="size-14px flex-shrink-0"><use href="#robot"></use></svg>
-    {{ isCurrentRoomStreaming ? t('aiclaw.chat.streaming') : t('aiclaw.chat.notice') }}
-  </div>
-</div>
+<!-- AI 助理区域：ThinkingPanel（群聊含 aiclaw + 私聊 AI 助理） -->
+<ThinkingPanel v-if="showThinkingPanel" />
 ```
 
 **新增 import**：
@@ -718,23 +727,28 @@ import ThinkingPanel from './ThinkingPanel.vue'
 **新增 computed**：
 
 ```typescript
+/** 是否显示 ThinkingPanel（D1 决策：群聊+私聊均统一） */
+const showThinkingPanel = computed(() => {
+  // 私聊 AI 助理
+  if (isAiclawSession.value) return true
+  // 群聊中有 aiclaw 成员
+  if (isGroup.value && hasAiclawInGroup.value) return true
+  return false
+})
+
 /** 群内是否有 aiclaw 成员（决定是否显示 ThinkingPanel） */
 const hasAiclawInGroup = computed(() => {
   if (!isGroup.value) return false
-  const groupStore = useGroupStore()
-  // 检查群成员列表中是否有 userType 为 aiclaw 的成员
-  // 实现方式取决于 groupStore 的数据结构
-  return chatStore.isCurrentRoomThinking || hasAiclawMemberInCurrentGroup()
+  // 当前房间有活跃思考，或有归档思考，或群成员列表中有 aiclaw
+  if (chatStore.isCurrentRoomThinking) return true
+  if (chatStore.thinkingArchive.get(globalStore.currentSessionRoomId ?? '')?.length) return true
+  return hasAiclawMemberInCurrentGroup()
 })
 ```
 
-**注意**：`isAiclawSession`（私聊 AI 助理）的判断逻辑不变，仅在群聊场景显示 ThinkingPanel。私聊 AI 助理仍使用原有的 notice 条。REQ-004 §2.3.2 明确"私聊同样走 agent loop 模型"，后续私聊场景也需升级为 ThinkingPanel，但本期范围建议先覆盖群聊。
-
-**待 manager 决策**：私聊 AI 助理是否本期也切换为 ThinkingPanel？如果切换，条件可简化为：
-
-```vue
-<ThinkingPanel v-if="isAiclawSession || (isGroup && hasAiclawInGroup)" />
-```
+**移除的代码**：
+- 删除 `isCurrentRoomStreaming` computed（由 `chatStore.isCurrentRoomThinking` 替代）
+- 保留 `isAiclawSession` computed（仍用于 ChatHeader 等其他位置判断）
 
 ### 3.5 群配置入口
 
@@ -790,6 +804,10 @@ const hasAiclawInGroup = computed(() => {
         </n-form-item>
         <n-form-item :label="t('aiclaw.group_settings.respond_to_ai')">
           <n-switch v-model:value="config.respondToAi" />
+        </n-form-item>
+        <n-form-item :label="t('aiclaw.group_settings.mention_required')">
+          <n-switch v-model:value="config.mentionRequired" />
+          <span class="text-11px text-#999 ml-4px">{{ t('aiclaw.group_settings.mention_required_hint') }}</span>
         </n-form-item>
       </n-form>
       <n-button size="small" type="primary" @click="saveGroupConfig(config)">
@@ -854,37 +872,61 @@ const saveAiclawGroupConfig = async (aiclawUid: number, roomId: number, config: 
 
 ### 3.6 autoReply 消息处理
 
-**X2 跨组对齐结论**：`autoReply` 标记放在 `MsgType` 顶层 `extra` 字段（JSON）。
+**X2 跨组对齐结论（v1.1 已修正）**：`autoReply` **不入库**，仅在 WS `receiveMessage` payload 中携带。
 
-**方案**：扩展 `MsgType` 类型定义
+**方案**：在 WS 消息事件中检测 autoReply 标记
 
 ```typescript
-// src/services/types.ts
-export type MsgType = {
-  id: string
-  roomId: string
-  type: MsgEnum
-  body: MessageBody
-  sendTime: number
-  messageMarks: MessageMarkType
-  status: MessageStatusEnum
-  /** 消息元数据扩展字段（REQ-004: autoReply 标记等） */
-  extra?: Record<string, unknown>
+// layout/index.vue — RECEIVE_MESSAGE handler 修改
+useMitt.on(WsResponseMessageType.RECEIVE_MESSAGE, async (data: MessageType & { extra?: Record<string, unknown> }) => {
+  // 检测 autoReply 标记（仅 WS payload 携带，不入库）
+  const isAutoReply = (data as any).extra?.autoReply === true
+
+  // 正常走消息推送流程
+  chatStore.pushMsg(normalizeMsgSendTime(data), { ... })
+
+  // 如果是 autoReply 消息，在消息上标记（用于 UI 区分展示）
+  if (isAutoReply) {
+    // 标记此消息为 autoReply（内存标记，不持久化）
+    chatStore.markMessageAsAutoReply(data.message.id, data.message.roomId)
+  }
+})
+```
+
+**chat.ts 新增**：
+
+```typescript
+/** autoReply 消息标记集（内存，不持久化） */
+const autoReplyMessages = reactive(new Set<string>())  // msgId 集合
+
+/** 标记消息为 autoReply */
+const markMessageAsAutoReply = (msgId: string, roomId: string) => {
+  autoReplyMessages.add(msgId)
+}
+
+/** 检查消息是否为 autoReply */
+const isAutoReplyMessage = (msgId: string): boolean => {
+  return autoReplyMessages.has(msgId)
 }
 ```
 
 **前端展示逻辑**：
 
 1. **autoReply 消息正常显示**：作为普通聊天气泡展示，内容为限流说明文字
-2. **视觉区分**：autoReply 消息添加浅色背景或小标签，提示用户这是系统自动回复
+2. **视觉区分**：autoReply 消息添加小标签，提示用户这是系统自动回复
 3. **前端不参与防循环**：autoReply 跳过 agent loop 的逻辑在 aichat-node 层，前端仅负责展示
 
 ```vue
 <!-- RenderMessage 中 autoReply 标记 -->
-<div v-if="message.message.extra?.autoReply" class="auto-reply-tag text-(10px #999) mb-2px">
+<div v-if="chatStore.isAutoReplyMessage(item.message.id)" class="auto-reply-tag text-(10px #999) mb-2px">
   {{ t('aiclaw.auto_reply_tag') }}
 </div>
 ```
+
+**注意**：autoReply 标记仅存在于 WS 推送的 `extra` 字段中，**不入 `im_message` 表**。因此：
+- 历史消息加载（`/chat/msg/page`）不含 autoReply 标记 — 这是预期行为
+- 刷新/重登后 autoReply 标记丢失 — 这是预期行为（限流说明是一次性提示）
+- `MsgType` 类型定义**不需要新增 extra 字段**（v1.0 方案已取消）
 
 ### 3.7 移动端范围
 
@@ -920,13 +962,18 @@ export type MsgType = {
 | `thinkingEnd` | server → client | `ThinkingEndPayload` | `chatStore.finalizeThinking()` |
 | `aiclawGroupConfigUpdate` | server → client | `AiclawGroupConfigUpdatePayload` | `chatStore.updateAiclawGroupConfig()` |
 
-### 4.3 MsgType 扩展
+### 4.3 autoReply WS Payload 约定
 
+autoReply 标记仅在 WS `receiveMessage` 事件 payload 的 `extra` 字段中携带，**不入 `im_message` 表**：
 ```typescript
-// 新增可选字段
-extra?: Record<string, unknown>
-// 用法：message.extra?.autoReply === true → 系统自动回复标记
+// WS receiveMessage payload（server → client）
+{
+  type: 'receiveMessage',
+  data: MessageType,  // 现有消息结构不变
+  extra?: { autoReply?: boolean, reason?: string }  // 仅 WS 层携带
+}
 ```
+前端通过 `(data as any).extra?.autoReply` 检测，标记到内存 Set 中。`MsgType` 类型定义不新增 extra 字段。
 
 ---
 
@@ -934,9 +981,9 @@ extra?: Record<string, unknown>
 
 | 编号 | 议题 | 结论 | 状态 |
 |------|------|------|------|
-| X1 | THINKING WS payload 完整字段 | 见 §3.1 类型定义，需 server-dev 确认 `aiclawName`/`aiclawAvatar` 是否由 server 回填 | 待对齐 |
-| X2 | autoReply 字段载体 | 放 `MsgType.extra` 顶层 JSON 字段，格式 `{ autoReply: true, reason?: string }` | 已与 plugin-dev 初步对齐，待 server-dev 确认 |
-| X5 | 群配置 WS 通知 payload | 见 §3.1 `AiclawGroupConfigUpdatePayload`，含完整 config 对象 + roomId + aiclawUid，推送范围仅 aiclaw 的 node + 主人客户端 | 已与 plugin-dev 初步对齐 |
+| X1 | THINKING WS payload 完整字段 | 见 §3.1 类型定义。thinkingId 由 server 生成（Long 自增主键 → String）。aiclawName/aiclawAvatar 待 server-dev 确认是否回填 | 已与 server-dev 对齐 |
+| X2 | autoReply 字段载体 | **不入库**，仅在 WS `receiveMessage` payload 的 `extra` 字段中携带。前端从 WS 事件检查，用内存 Set 标记，不修改 `MsgType` 类型定义 | 已与 server-dev + plugin-dev 对齐 |
+| X5 | 群配置 WS 通知 payload | 见 §3.1 `AiclawGroupConfigUpdatePayload`，含完整 config 对象 + roomId + aiclawUid。**推送范围：群内所有在线成员 + aichat-node**（非主人也收到，用于 UI 提示） | 已与 server-dev + plugin-dev 对齐 |
 | X3 | 防循环分层 | 前端仅负责 autoReply 展示，不参与防循环逻辑 | 无需对齐 |
 | X4 | aichat-claw Token 上下文 | 前端不涉及 | 无需对齐 |
 | X6 | 上下文窗口 50 条 | 前端不涉及 | 无需对齐 |
@@ -1012,9 +1059,12 @@ extra?: Record<string, unknown>
     "rate_limit_hint": "条/分钟（0=无限制）",
     "daily_limit": "每日上限",
     "respond_to_ai": "响应其他 AI",
+    "mention_required": "需要 @ 触发",
+    "mention_required_hint": "开启后 AI 仅在被 @ 时回复",
     "save": "保存",
     "save_success": "配置已保存",
-    "save_failed": "保存失败"
+    "save_failed": "保存失败",
+    "config_changed": "AI 助理 {name} 的群聊配置已更新"
   },
   "auto_reply_tag": "自动回复"
 }
@@ -1042,6 +1092,8 @@ extra?: Record<string, unknown>
     "rate_limit_hint": "msgs/min (0=unlimited)",
     "daily_limit": "Daily Limit",
     "respond_to_ai": "Respond to other AI",
+    "mention_required": "Require @ mention",
+    "mention_required_hint": "AI only replies when @mentioned",
     "save": "Save",
     "save_success": "Settings saved",
     "save_failed": "Save failed"
@@ -1074,21 +1126,21 @@ extra?: Record<string, unknown>
 | F4 | `ThinkingCard.vue` 组件实现 | 0.5 | F2 | 头部 + 内容区 + 流式光标 + 折叠 + 样式 |
 | F5 | `ThinkingPanel.vue` 容器实现 | 0.5 | F4 | 多卡片列表 + 归档入口 + 抽屉 |
 | F6 | `ChatMain.vue` 集成 | 0.2 | F5 | 替换 AI notice bar + import + computed |
-| F7 | `MsgType.extra` 扩展 + autoReply 展示 | 0.2 | 无 | 类型定义 + RenderMessage 标记 |
+| F7 | autoReply 展示（WS payload 检测） | 0.2 | 无 | 内存 Set 标记 + RenderMessage 标记 |
 | F8 | 群配置：store 状态 + API 调用 | 0.3 | F1 | aiclawGroupConfigs Map + load/save/update |
 | F9 | 群配置：桌面端 UI（aiAssistantWindow） | 0.5 | F8 | 子视图 + 配置表单 + save handler |
 | F10 | 群配置：移动端 UI（AiAssistantGroupSettings.vue） | 0.3 | F8 | 新页面 + 路由 |
 | F11 | i18n 文案 | 0.2 | 无 | zh-CN + en |
 | F12 | 联调测试 | 0.5 | 全部 | 与 server-dev / plugin-dev 端到端验证 |
-| **总计** | | **3.8 天** | | |
+| **总计** | | **4.1 天** | | |
 
 ---
 
-## 10. 待 manager 决策项
+## 10. Manager 决策记录（v1.0 → v1.1）
 
-| # | 问题 | 选项 | 影响 |
+| # | 决策 | 结论 | 影响 |
 |---|------|------|------|
-| D1 | 私聊 AI 助理是否本期也切换为 ThinkingPanel？ | A: 仅群聊（本期简化）<br>B: 群聊 + 私聊均切换 | 选 B 需额外 ~0.3 天，且需确认私聊 thinking 事件 |
-| D2 | `MsgType.extra` 字段是放在 `MsgType` 顶层还是 `body` 内？ | A: `MsgType` 顶层（推荐，元数据语义）<br>B: `body` 内（需改 TextBody 等多个类型） | 选 A 改动更小，选 B 需改更多类型定义 |
-| D3 | 群配置是否支持 "@ 触发" 选项？ | A: 本期不含（UI 预留但 disabled）<br>B: 本期完整实现 | 需求.md §4.1 `im_aiclaw_group_config` 含 `mention_required` 字段，但 reviewer I2 指出与 §2.2 矛盾 |
-| D4 | THINKING_END 后归档延迟 30s 是否合适？ | 30s（推荐）<br>60s<br>用户可配置 | 过短用户来不及点击回顾，过长占用面板空间 |
+| D1 | 私聊 AI 助理是否本期也切换为 ThinkingPanel？ | **B: 群聊 + 私聊均切换**（统一体验） | +0.3 天，工作量从 3.8 → 4.1 天 |
+| D2 | `MsgType.extra` 字段位置 | **A: 不放在 MsgType**，autoReply 仅在 WS payload 携带，前端用内存 Set 标记 | 不修改 `MsgType` 类型定义 |
+| D3 | 群配置是否支持 "@ 触发" 选项？ | **B: 本期完整实现**（UI 正常展示，不 disabled） | +0.05 天（1 个 switch 组件） |
+| D4 | THINKING_END 后归档延迟 30s 是否合适？ | **30s**（不变） | — |
