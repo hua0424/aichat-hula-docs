@@ -138,3 +138,14 @@ useMitt.on(WsResponseMessageType.AICLAW_GROUP_CONFIG_UPDATE, (data: AiclawGroupC
 ## 7. 附件
 
 - 前端 commit：`69a8cd2d5` (`feat(REQ-004/M3): aiclaw group config + autoReply UI`)
+- 修复 commit：`9389a507c` (`fix(REQ-004/M3): add AICLAW_GROUP_CONFIG_UPDATE WS handler`)
+
+---
+
+## 8. P1 修复复测（commit `9389a507c`）
+
+| 原问题 | 修复内容 | 复测结果 |
+|--------|----------|----------|
+| **P1** layout/index.vue 缺少 AICLAW_GROUP_CONFIG_UPDATE WS handler | 导入 `AiclawGroupConfigUpdatePayload` 类型，追加 `useMitt.on(WsResponseMessageType.AICLAW_GROUP_CONFIG_UPDATE, ...)` handler，调用 `chatStore.updateAiclawGroupConfig(data.aiclawUid, data.roomId, data.config)` | **通过** |
+
+**复测结论**：P1 修复逻辑正确，代码审查通过。
