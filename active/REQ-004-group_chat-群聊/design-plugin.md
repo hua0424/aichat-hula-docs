@@ -2,8 +2,18 @@
 
 > Owner: plugin-dev
 > 日期：2026-05-20
+> 版本：v1.1（manager 初评后迭代）
 > 阶段：详细设计
 > 输入：需求.md v2.1 + assessment-plugin-dev.md + design-tasks.md
+
+**变更日志（v1.0 → v1.1）：**
+- M1：确认采纳 A + 边界约束（§E.3）
+- M2：排查 openclaw sessionKey 行为，X6 关闭（§四.X6）
+- X1：triggerMsgId 统一为 string，aiclawName 从 server payload 移除（§F.2）
+- X2：autoReply 改走 WS payload only（manager 决策，§D.1 / §四.X2）
+- M3：群配置推送范围改为群内所有在线成员（§F.3 / §四.X5）
+- THINKING_DELTA/END payload 增加 roomId 字段（§F.2）
+- userType 确认：`im_user.user_type = 2` = 机器人（§A.4）
 
 ---
 
@@ -125,7 +135,7 @@ sequenceDiagram
     Node->>Node: AntiLoopGuard 检查：触发频率限制
     Node->>Claw: hula_send_message (extra={autoReply:true})
     Claw->>Server: REST POST /api/im/chat/msg
-    Note over Server: im_message.extra = {"autoReply":true}
+    Note over Server: WS payload 携带 autoReply:true（不入库）
     Server->>Node: WS receiveMessage (autoReply)
     Node->>Node: 检测到 autoReply，跳过 agent loop
 ```
@@ -232,7 +242,7 @@ private handleReceiveMessage(data: ReceivedMessage): void {
   }
   
   // 6. 【新增】AI 互触发检查
-  const isFromAi = data.fromUser.userType === 2; // 假设 2=aiclaw
+  const isFromAi = data.fromUser.userType === 2; // 2=机器人（已确认 im_user.user_type 枚举）
   const config = this.groupConfigCache.get(this.selfUid, roomId);
   if (isFromAi && !config?.respondToAi) {
     console.log(`[handler] Skipping AI message (respondToAi=false)`);
@@ -587,7 +597,7 @@ const schema = {
     extra: Type.Optional(
       Type.Object(
         {},
-        { description: '额外字段，如 { autoReply: true }' }
+        { description: '额外字段（如 { autoReply: true }），server 侧不入库，仅在 WS 推送时携带' }
       )
     ),
   },
@@ -840,30 +850,33 @@ export class AntiLoopGuard {
 }
 ```
 
-#### E.3 autoReply 发送逻辑
+#### E.3 autoReply 发送逻辑（M1 已定案）
+
+**决策：采纳方案 A**（manager 决策）
+
+aichat-node 内嵌轻量 `HulaApiClient`，用于 autoReply 发送和 CLI 命令。
+
+**边界约束**：
+- 仅用于 autoReply 这一特殊场景（限流触发、agent 未启动）
+- **不扩展为通用消息发送通道**，避免与 aichat-claw 的 Tool 路径混淆
+- 普通消息仍由 agent 通过 `hula_send_message` Tool 发送
 
 ```ts
 private sendAutoReply(roomId: number, reason: string): void {
-  // 通过 aichat-claw 的 REST API 直接发送
-  // 注意：aichat-node 当前不直接持有 HulaApiClient，需要通过某种方式发送
-  // 
-  // 方案 1：通过 WS 发送一条特殊消息（需 server 支持）
-  // 方案 2：aichat-node 也持有 HulaApiClient 实例
-  // 方案 3：通过 openclaw adapter 触发一次特殊的 agent loop 只发 autoReply
-  //
-  // 【推荐方案 2】：aichat-node 持有轻量 HulaApiClient，用于 autoReply 和 CLI
+  // aichat-node 内嵌的轻量 HulaApiClient
+  // 仅用于 autoReply 等特殊场景，不替代 Tool 路径
+  const api = this.getInternalApiClient();
+  api.sendMessage(roomId, `发言受限：${reason}`, { autoReply: true })
+    .catch(err => console.error('[anti-loop] autoReply failed:', err.message));
 }
 ```
 
-**待 manager 决策 M1：** aichat-node 发送 autoReply 的路径
-
-| 选项 | 路径 | 优点 | 缺点 |
-|------|------|------|------|
-| A | aichat-node 内嵌 HulaApiClient，直接 REST 发送 | 简单直接，不依赖 adapter | 增加组件耦合 |
-| B | 通过 WS 发送一条特殊请求到 server（需新协议） | 统一 WS 通道 | 需 server 新增处理 |
-| C | 触发 openclaw 发送（如通过特殊 Tool 调用） | 符合 Agent Loop 模型 | 延迟大，过度设计 |
-
-**推荐 A**，但需确认。
+**autoReply 标记的传递路径**：
+1. aichat-node 调用 `HulaApiClient.sendMessage(roomId, content, { autoReply: true })`
+2. REST API `POST /api/im/chat/msg` 携带 `extra: { autoReply: true }`
+3. server 侧 **不入库 extra**（im_message 零改动），仅在 WS 推送 payload 中携带
+4. 其他 aiclaw 的 aichat-node 收到后检查 payload 中的 autoReply 标记，跳过 agent loop
+5. 前端可选择性展示 autoReply 消息（如灰色提示条）
 
 ---
 
@@ -913,17 +926,22 @@ interface ThinkingStartPayload {
   roomId: number;         // 群聊房间 ID
   triggerMsgId: string;   // 触发本次思考的消息 ID
 }
+// → server 返回: { thinkingId, fromUid, roomId, triggerMsgId }
 
 // THINKING_DELTA (21)
 interface ThinkingDeltaPayload {
+  thinkingId: string;     // server 分配的 thinking 记录 ID
   chunk: string;          // thinking 内容增量
   seq: number;            // 序列号（从 1 递增）
+  roomId?: number;        // 【冗余】方便调试，减少 server 一次 DB 查询
 }
 
 // THINKING_END (22)
 interface ThinkingEndPayload {
+  thinkingId: string;     // server 分配的 thinking 记录 ID
   durationMs: number;     // 处理耗时
   error?: string;         // 出错时携带错误信息
+  roomId?: number;        // 【冗余】方便调试
 }
 ```
 
@@ -935,7 +953,7 @@ interface ThinkingStartDTO {
   fromUid: number;
   roomId: number;
   triggerMsgId: string;
-  aiclawName?: string;    // aiclaw 名称，前端展示用
+  // aiclawName 由前端通过 fromUid 查本地用户缓存获取，server 不携带
 }
 
 // thinkingDelta
@@ -1146,34 +1164,35 @@ function resolveToken(): string {
 
 ## 四、跨组对齐项结论
 
-### X1. THINKING WS payload 字段
+### X1. THINKING WS payload 字段 ✅ 已定案
 
-**plugin-dev 提案**（见 §F.2）：
+**与 server-dev 对齐后最终方案**（见 §F.2）：
 
 | 方向 | 类型 | 字段 | 说明 |
 |------|------|------|------|
-| plugin→server | 20 THINKING_START | fromUid, roomId, triggerMsgId | |
-| plugin→server | 21 THINKING_DELTA | chunk, seq | |
-| plugin→server | 22 THINKING_END | durationMs, error? | |
-| server→client | thinkingStart | fromUid, roomId, triggerMsgId, aiclawName? | aiclawName 供前端展示 |
+| plugin→server | 20 THINKING_START | fromUid, roomId, triggerMsgId | triggerMsgId: **string**（BIGINT 精度安全） |
+| plugin→server | 21 THINKING_DELTA | thinkingId, chunk, seq, roomId? | roomId 冗余，方便调试 |
+| plugin→server | 22 THINKING_END | thinkingId, durationMs, error?, roomId? | thinkingId 由 server 在 START 时返回 |
+| server→client | thinkingStart | fromUid, roomId, triggerMsgId | aiclawName 由前端本地缓存查 |
 | server→client | thinkingDelta | fromUid, roomId, chunk, seq | |
 | server→client | thinkingEnd | fromUid, roomId, durationMs, error? | |
 
-**待 server-dev 确认：**
-- 字段命名是否与 server 侧现有 DTO 风格一致
-- `triggerMsgId` 类型：string vs number（server 侧消息 ID 的序列化方式）
+**关键结论：**
+- `triggerMsgId` 统一为 **string**（避免 JS/TS BIGINT 精度丢失）
+- THINKING_DELTA/END 携带 `thinkingId`（server 分配的 thinking 记录主键），server 从 `im_aiclaw_thinking` 反查 roomId 做路由
+- `roomId` 作为可选冗余字段携带，减少 server 一次 DB 查询
 
-### X2. autoReply 载体
+### X2. autoReply 载体 ✅ 已定案
 
-**plugin-dev 提案**（见 §D.1）：
-- autoReply 标记放在 `im_message.extra`（JSON 字段）中
-- 格式：`{ "autoReply": true, "reason": "rate_limit" }`
-- 前端收到消息后检查 `extra.autoReply`，决定是否展示或样式处理
-- aichat-node 收到后跳过 agent loop
+**manager 决策：采纳 server-dev 方案 B（仅 WS payload，不入库）**
 
-**待 server-dev + frontend-dev 确认：**
-- server 是否支持 `im_message.extra` 字段
-- 前端是否接受 extra 字段方案
+- autoReply 标记 **不入 `im_message`**（需求硬约束：im_message 零改动）
+- aichat-node 通过 `hula_send_message` 调用 REST API 时携带 `extra: { autoReply: true }`
+- server 侧 **不入库 extra**，仅在 WS 推送 payload 中携带 autoReply 标记
+- 其他 aiclaw 的 aichat-node 收到 WS payload 后检查 autoReply，跳过 agent loop
+- 前端可选择性展示 autoReply 消息（如灰色提示条）
+
+**注意：** `im_message` 表实际已有 `extra` JSON 字段（DB 调查发现），但 manager 明确要求本期零改动，故 autoReply 不走落库。
 
 ### X3. 防循环分层最终方案
 
@@ -1194,9 +1213,9 @@ function resolveToken(): string {
 - openclaw gateway 在 Tool execute 时是否提供 agent token/session
 - 如不提供，openclaw 是否至少提供 `aiclawUid`
 
-### X5. 群配置 WS 通知 payload
+### X5. 群配置 WS 通知 payload ✅ 已定案
 
-**plugin-dev 提案**（见 §F.3）：
+**payload 格式**（见 §F.3）：
 
 ```ts
 interface GroupConfigUpdateDTO {
@@ -1211,25 +1230,27 @@ interface GroupConfigUpdateDTO {
 }
 ```
 
-**待 server-dev + frontend-dev 确认：**
-- 推送范围：仅推送给该 aiclaw 的 node + 主人客户端，还是群内所有客户端
-- 变更触发方式：REST API 修改后立即广播，还是 MQ 异步广播
+**推送范围**（manager 决策）：
+- **群内所有在线成员 + aichat-node**（非仅 aiclaw 相关方）
+- 前端可做"配置变更"UI 反馈（如提示"群聊设置已更新"）
+- aichat-node 通过 `selfUid === aiclawUid` 过滤是否是自己的配置
 
-### X6. 上下文窗口归属
+**变更触发方式**：REST API 修改后立即 WS 广播
 
-**plugin-dev 分析：**
-- 需求 §2.2 提到"上下文窗口：最近 N 条消息（默认 50）"
-- 如果由 aichat-node 维护：需要缓存最近 50 条消息，内存占用大
-- 如果由 server 维护：server 提供 API 查询最近 N 条消息，node 按需获取
+### X6. 上下文窗口归属 ✅ 已关闭
 
-**plugin-dev 建议：**
-- 由 **server 提供上下文查询 API**（如 `GET /api/im/chat/history?roomId=X&limit=50`）
-- aichat-node 在调用 `adapter.chat()` 前，通过 API 获取上下文并拼接为 prompt
-- 优点：server 有完整消息历史，查询准确；node 无状态
-- 缺点：增加一次 API 调用延迟（可接受）
+**排查结论：aichat-node 不需要做上下文管理**
 
-**待 server-dev 确认：**
-- 是否提供此类 API，接口签名如何
+通过对 openclaw gateway 的排查发现：
+1. openclaw config 中 `hooks.internal.entries.session-memory: { "enabled": true }` — session-memory hook 已启用
+2. openclaw 会话目录（`~/.openclaw/agents/*/sessions/`）中存在按 sessionKey 组织的 jsonl 对话历史文件，包含完整的 message tree（parentId 关联）
+3. openclaw 运行时显示 `Context: 12k/272k (4%)` 和 `Cache: 73% hit` — 证明 conversation context 被缓存和复用
+4. `sessionKey` 参数在 `agent` RPC 请求中被传递，openclaw 自动加载对应 session 的历史对话
+
+**结论：**
+- openclaw gateway **已通过 sessionKey 维护 conversation history**
+- aichat-node 只需保持 `sessionKey` 格式稳定（`aiclaw-{selfUid}-room-{roomId}`）
+- **不需要 server 提供上下文查询 API，X6 关闭**
 
 ---
 
@@ -1238,7 +1259,7 @@ interface GroupConfigUpdateDTO {
 | 风险 | 等级 | 描述 | 降级方案 |
 |------|------|------|----------|
 | R1 | 中 | openclaw 不提供 Tool execution context | 回退到方案 B（实例池），增加约 0.5 天工作量 |
-| R2 | 低 | server 不支持 `im_message.extra` 字段 | autoReply 改走 WS payload only，限流说明消息不入库（reviewer 方案 B） |
+| R2 | 低 | `im_message.extra` 字段落库策略分歧 | 已决议：autoReply 仅 WS payload 携带，不入库（im_message 零改动） |
 | R3 | 低 | THINKING payload 字段与 server 不一致 | 设计阶段对齐，若不一致按 server 为准调整 |
 | R4 | 低 | aichat-node 内存层状态丢失（重启） | 可接受：AI-to-AI 计数器重置，短暂高频后恢复退避 |
 | R5 | 低 | 群配置 API 延迟导致限流失效 | server 层做兜底，node 层提前拒绝 |
@@ -1284,10 +1305,16 @@ interface GroupConfigUpdateDTO {
 
 ---
 
-## 七、待决策事项
+## 七、决策记录
 
-| 编号 | 问题 | 选项 | 建议 |
+| 编号 | 问题 | 决策 | 依据 |
 |------|------|------|------|
-| **M1** | aichat-node 发送 autoReply 的路径 | A: 内嵌 HulaApiClient / B: WS 特殊请求 / C: 通过 adapter | **推荐 A** |
-| **M2** | 上下文窗口维护归属 | server 提供 API / node 本地缓存 | **推荐 server API** |
-| **M3** | 群配置 WS 通知推送范围 | 仅 aiclaw 相关方 / 群内广播 | 待 server-dev 技术评估 |
+| **M1** | aichat-node 发送 autoReply 的路径 | **采纳 A**：内嵌轻量 HulaApiClient | manager 决策，边界约束见 §E.3 |
+| **M2** | 上下文窗口维护归属 | **X6 关闭**：openclaw 已通过 sessionKey 维护 history | openclaw session-memory hook 启用 + 会话 jsonl 文件实证 |
+| **M3** | 群配置 WS 通知推送范围 | **群内所有在线成员 + aichat-node** | manager 决策 |
+
+**当前开放问题（无阻塞）：**
+
+| 编号 | 问题 | 状态 |
+|------|------|------|
+| X4-R1 | openclaw Tool execution context 是否提供 agent credential | 待 server-dev 确认 openclaw 行为，plugin-dev 按方案 B 保底实现 |
