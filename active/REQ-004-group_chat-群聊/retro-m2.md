@@ -114,6 +114,35 @@ D1 决策落地。`isAiclawSession || (isGroup && hasAiclawInGroup)` 双分支�
 
 修复：server-dev commit `b4ed3241`，`.id(thinkingId)` 链式调用拆成 `build()` 后 `setId(thinkingId)`。
 
+**沉淀 3（M2 提测踩坑 II）**：S-M2-5 thinking_msg_rel 关联回写在 M2 实现遗漏 — 设计文档 §3.1.3 / §S5 明确要求，但 ChatController 接收 `extra.thinkingId` 后未做任何处理。backend-tester 端到端验证时发现。
+
+→ **规则**：任务清单 §3.2 / 设计文档跨模块要求项，开发完成自检时**必须逐条对照核查**，不能仅看本方代码是否实现。S5 跨 server + plugin + claw 三方，server-dev 实现 plugin 那一侧（hula_send_message extra 参数）但忘了自己这一侧的接收处理。
+
+修复：server-dev commit `19035938` 在 `MsgSendConsumer` 中读取 extra.thinkingId 并写关联表 + 更新 has_response。
+
+**沉淀 4（M2 提测踩坑 III — 新表 + tenant_id 隐患）**：`im_aiclaw_thinking` 表 DDL 无 `tenant_id` 字段，但 `AiclawThinking` 继承 `SuperEntity`。MyBatis-Plus 租户拦截器自动注入 `AND tenant_id = 1` → SQL 报错 `Unknown column 'tenant_id'`。
+
+→ **规则**：HuLa-Server 业务表默认开启租户拦截器，**继承 SuperEntity 的实体对应表 DDL 必须含 `tenant_id BIGINT`**。M1-fix 时 AiclawThinking 改为 SuperEntity 后，DDL 没同步加 tenant_id，正好踩坑。
+
+**M3 前置检查**：`im_aiclaw_group_config` 也继承 SuperEntity，DDL 当前**没有** tenant_id 字段，M3 启动前必须补全（DDL + ALTER TABLE）。已通知 server-dev。
+
+修复（M2-2）：server-dev DDL commit `c262b806` 给 `im_aiclaw_thinking` 补 `tenant_id`，dev MySQL 已执行 ALTER。
+
+---
+
+## 九、M2 修复闭环验证（2026-05-20）
+
+| 修复项 | 修复方 | 修复 commit | 复测方 | 结果 |
+|--------|--------|------------|--------|------|
+| P0 finalizeThinking setTimeout 竞态 | frontend-dev | `6ec980154` | ui-tester | ✅ 通过 |
+| P3 startThinking 旧超时未清理 | frontend-dev | 同上（合并修复） | ui-tester | ✅ 通过 |
+| P1 ThinkingCard 暗色模式 :class | frontend-dev | 同上 | ui-tester | ✅ 通过 |
+| P2-1 showThinkingPanel layout shift | frontend-dev | 同上 | ui-tester | ✅ 通过 |
+| S-M2-5 thinking_msg_rel 关联回写 | server-dev | `19035938` | backend-tester | ✅ 通过 |
+| M2-2 tenant_id DDL 缺失 | server-dev | `c262b806` + ALTER | backend-tester | ✅ 通过 |
+
+**M2 整体闭环。M3 已可启动（待 server-dev 确认 M3 表 tenant_id 同步处理后）。**
+
 ---
 
 ## 五、设计与代码同步状态
