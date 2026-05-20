@@ -2,7 +2,7 @@
 
 > Owner: plugin-dev
 > 日期：2026-05-20
-> 版本：v1.4（M3：短回复 skip 上收至 server 权威层）
+> 版本：v1.5（M3-fix：autoReply 触发条件 + error code 表）
 > 阶段：详细设计
 > 输入：需求.md v2.1 + assessment-plugin-dev.md + design-tasks.md + review-design-reviewer.md
 
@@ -14,6 +14,10 @@
   - X2：autoReply 改走 WS payload only（manager 决策，§D.1 / §四.X2）
   - M3：群配置推送范围改为群内所有在线成员（§F.3 / §四.X5）
   - THINKING_DELTA/END payload 增加 roomId 字段（§F.2）
+- v1.4 → v1.5（M3-fix autoReply 触发条件）：
+  - 明确 autoReply 触发条件：server `thinkingEnd` error + guard `block` action
+  - 新增 error code 表：`rate_limit_exceeded` / `daily_limit_exceeded` / `short_reply_skip`
+  - `short_reply_skip` 不触发 autoReply（避免循环）
 - v1.2 → v1.4（M3 短回复上收）：
   - **短回复 skip**：从 Node 内存层（AntiLoopGuard）上收至 Server 权威层（design-server §3.4.4）
   - 移除 AntiLoopGuard 中 `shouldSkipShortReply` / `recordReply` 设计（代码保留不调用，M3 回顾后删除）
@@ -915,6 +919,23 @@ private sendAutoReply(roomId: number, reason: string): void {
     .catch(err => console.error('[anti-loop] autoReply failed:', err.message));
 }
 ```
+
+**autoReply 触发条件**（v1.5 明确）：
+
+| 触发来源 | 条件 | autoReply 文案 |
+|---------|------|---------------|
+| Server `thinkingEnd` 广播 | `status="error"` + `error="rate_limit_exceeded"` | "发言频率限制，已自动跳过本次响应" |
+| Server `thinkingEnd` 广播 | `status="error"` + `error="daily_limit_exceeded"` | "今日发言上限已达，已自动跳过本次响应" |
+| Server `thinkingEnd` 广播 | `status="error"` + `error="short_reply_skip"` | **不触发 autoReply**（避免短回复+autoReply 互循环） |
+| Node `AntiLoopGuard.check()` | `action="block"` | 由 guard 的 `reason` 决定 |
+
+**Error Code 约定**（server → plugin）：
+
+| Error Code | 场景 | 来源 | Plugin 行为 |
+|-----------|------|------|------------|
+| `rate_limit_exceeded` | 频率超限（10条/分钟） | ws-biz ThinkingProcessor | sendAutoReply |
+| `daily_limit_exceeded` | 日限超限（1000条） | ws-biz ThinkingProcessor | sendAutoReply |
+| `short_reply_skip` | 连续短回复跳过 | im-biz ChatServiceImpl | 仅日志，不 autoReply |
 
 **autoReply 标记的传递路径**：
 1. aichat-node 调用 `HulaApiClient.sendMessage(roomId, content, { autoReply: true })`
