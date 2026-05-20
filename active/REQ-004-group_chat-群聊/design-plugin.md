@@ -2,7 +2,7 @@
 
 > Owner: plugin-dev
 > 日期：2026-05-20
-> 版本：v1.2（reviewer 评审后修订）
+> 版本：v1.5（M3-fix：autoReply 触发条件 + error code 表）
 > 阶段：详细设计
 > 输入：需求.md v2.1 + assessment-plugin-dev.md + design-tasks.md + review-design-reviewer.md
 
@@ -14,6 +14,14 @@
   - X2：autoReply 改走 WS payload only（manager 决策，§D.1 / §四.X2）
   - M3：群配置推送范围改为群内所有在线成员（§F.3 / §四.X5）
   - THINKING_DELTA/END payload 增加 roomId 字段（§F.2）
+- v1.4 → v1.5（M3-fix autoReply 触发条件）：
+  - 明确 autoReply 触发条件：server `thinkingEnd` error + guard `block` action
+  - 新增 error code 表：`rate_limit_exceeded` / `daily_limit_exceeded` / `short_reply_skip`
+  - `short_reply_skip` 不触发 autoReply（避免循环）
+- v1.2 → v1.4（M3 短回复上收）：
+  - **短回复 skip**：从 Node 内存层（AntiLoopGuard）上收至 Server 权威层（design-server §3.4.4）
+  - 移除 AntiLoopGuard 中 `shouldSkipShortReply` / `recordReply` 设计（代码保留不调用，M3 回顾后删除）
+  - 更新防循环层级表：Server 权威层增加短回复 skip
 - v1.1 → v1.2（reviewer 修订）：
   - **S3**：thinkingSessions 增加 5 分钟超时清理机制（§A.2 / §A.4）
   - **S4**：标注 AntiLoopGuard 多实例状态不同步限制（§E.2）
@@ -774,13 +782,14 @@ try {
 
 | 层级 | 负责规则 | 实现位置 | 状态持久化 |
 |------|----------|----------|-----------|
-| **Server 权威层** | 频率限制（10/分钟）、每日上限（1000） | HuLa-Server IM Svc | DB + Redis |
-| **Node 内存层** | AI 互触发开关、短回复跳过、autoReply 跳过、指数退避 | aichat-node AntiLoopGuard | 内存（可丢失） |
+| **Server 权威层** | 频率限制（10/分钟）、每日上限（1000）、**短回复 skip** | HuLa-Server IM Svc | DB + Redis |
+| **Node 内存层** | AI 互触发开关、autoReply 跳过、指数退避 | aichat-node AntiLoopGuard | 内存（可丢失） |
 
 **理由：**
-- 频率/日限需要精确、持久化、跨实例共享 → 必须 server 层
-- AI 互触发、短回复、退避是"软限制"，允许偶尔失效 → node 内存层足够
+- 频率/日限/短回复需要精确、持久化、跨实例共享 → 必须 server 层
+- AI 互触发、退避是"软限制"，允许偶尔失效 → node 内存层足够
 - aichat-node 保持无状态，不引入 Redis/文件依赖
+- **短回复上收原因**：aichat-node 与 aichat-claw 不在同一进程（node=WS 客户端，claw=openclaw 插件），消息通过 claw 的 `hula_send_message` Tool 直接发 server，node 无法拦截发送路径 → server 权威层是唯一能统一检查的位置
 
 #### E.2 AntiLoopGuard 设计
 
@@ -808,8 +817,6 @@ interface RoomState {
   lastMessageFromAi: boolean;
   /** 最后一条消息的 fromUid */
   lastFromUid: number;
-  /** 最近 3 条本 aiclaw 回复的长度 */
-  recentReplyLengths: number[];
   /** 更新时间 */
   lastUpdateTime: number;
 }
@@ -835,7 +842,6 @@ export class AntiLoopGuard {
         aiRoundCount: 0,
         lastMessageFromAi: false,
         lastFromUid: 0,
-        recentReplyLengths: [],
         lastUpdateTime: Date.now(),
       };
       this.roomStates.set(roomKey, state);
@@ -868,46 +874,6 @@ export class AntiLoopGuard {
     return { action: 'allow' };
   }
   
-  /** 短回复跳过检查：agent 决定发送时调用 */
-  shouldSkipShortReply(roomId: number, replyContent: string): boolean {
-    const roomKey = String(roomId);
-    const state = this.roomStates.get(roomKey);
-    if (!state) return false;
-    
-    const length = replyContent.trim().length;
-    state.recentReplyLengths.push(length);
-    if (state.recentReplyLengths.length > 3) {
-      state.recentReplyLengths.shift();
-    }
-    
-    // 最近 3 条均 < 10 字符时跳过
-    if (state.recentReplyLengths.length === 3) {
-      return state.recentReplyLengths.every(l => l < 10);
-    }
-    return false;
-  }
-  
-  /** 记录一次本 aiclaw 的回复（用于短回复跟踪） */
-  recordReply(roomId: number, content: string): void {
-    const roomKey = String(roomId);
-    let state = this.roomStates.get(roomKey);
-    if (!state) {
-      state = {
-        aiRoundCount: 0,
-        lastMessageFromAi: false,
-        lastFromUid: 0,
-        recentReplyLengths: [],
-        lastUpdateTime: Date.now(),
-      };
-      this.roomStates.set(roomKey, state);
-    }
-    state.recentReplyLengths.push(content.trim().length);
-    if (state.recentReplyLengths.length > 3) {
-      state.recentReplyLengths.shift();
-    }
-    state.lastUpdateTime = Date.now();
-  }
-  
   private calculateBackoffDelay(aiRoundCount: number): number {
     if (aiRoundCount <= 5) return 0;
     if (aiRoundCount <= 10) return 5000;
@@ -930,7 +896,6 @@ export class AntiLoopGuard {
 
 `AntiLoopGuard` 的 `roomStates` 和 `aiRoundCount` 维护在**单 aichat-node 进程内存**中。如果同一 aiclaw 运行多个 aichat-node 实例（水平扩展）：
 - 各实例的 `aiRoundCount` 互不同步，指数退避效果减弱
-- `recentReplyLengths`  likewise 不同步
 
 **当前部署假设**：每个 aiclaw 仅运行一个 aichat-node 进程（单实例）。若未来需水平扩展，需引入 Redis 或共享存储同步 `aiRoundCount`。
 
@@ -954,6 +919,23 @@ private sendAutoReply(roomId: number, reason: string): void {
     .catch(err => console.error('[anti-loop] autoReply failed:', err.message));
 }
 ```
+
+**autoReply 触发条件**（v1.5 明确）：
+
+| 触发来源 | 条件 | autoReply 文案 |
+|---------|------|---------------|
+| Server `thinkingEnd` 广播 | `status="error"` + `error="rate_limit_exceeded"` | "发言频率限制，已自动跳过本次响应" |
+| Server `thinkingEnd` 广播 | `status="error"` + `error="daily_limit_exceeded"` | "今日发言上限已达，已自动跳过本次响应" |
+| Server `thinkingEnd` 广播 | `status="error"` + `error="short_reply_skip"` | **不触发 autoReply**（避免短回复+autoReply 互循环） |
+| Node `AntiLoopGuard.check()` | `action="block"` | 由 guard 的 `reason` 决定 |
+
+**Error Code 约定**（server → plugin）：
+
+| Error Code | 场景 | 来源 | Plugin 行为 |
+|-----------|------|------|------------|
+| `rate_limit_exceeded` | 频率超限（10条/分钟） | ws-biz ThinkingProcessor | sendAutoReply |
+| `daily_limit_exceeded` | 日限超限（1000条） | ws-biz ThinkingProcessor | sendAutoReply |
+| `short_reply_skip` | 连续短回复跳过 | im-biz ChatServiceImpl | 仅日志，不 autoReply |
 
 **autoReply 标记的传递路径**：
 1. aichat-node 调用 `HulaApiClient.sendMessage(roomId, content, { autoReply: true })`
@@ -1291,8 +1273,8 @@ function resolveToken(): string {
 
 | 层级 | 规则 | 位置 |
 |------|------|------|
-| Server 权威层 | 频率限制、每日上限 | HuLa-Server IM Svc |
-| Node 内存层 | AI 互触发、短回复跳过、autoReply 跳过、指数退避 | aichat-node |
+| Server 权威层 | 频率限制、每日上限、**短回复 skip** | HuLa-Server IM Svc |
+| Node 内存层 | AI 互触发、autoReply 跳过、指数退避 | aichat-node |
 
 ### X4. aichat-claw Token 上下文（R1）
 

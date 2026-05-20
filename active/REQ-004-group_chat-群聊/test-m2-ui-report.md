@@ -200,4 +200,18 @@ if (existing && existing.status === 'thinking') {
 ## 7. 附件
 
 - 前端 commit：`896f1b848` (`REQ-004(M2): frontend thinking UI — store + events + components`)
+- 修复 commit：`c2bb6d2cf` (`fix(REQ-004/M2): P0+P3 setTimeout race, P1 dark mode, P2-1 layout shift`)
 - 设计文档：`design-frontend.md` v1.2
+
+---
+
+## 8. P0-P1-P2-1 修复复测（commit `c2bb6d2cf`）
+
+| 原问题 | 修复内容 | 复测结果 |
+|--------|----------|----------|
+| **P0** finalizeThinking setTimeout 竞态 | ThinkingState 新增 `archiveTimeoutId`；startThinking 覆盖前 `clearTimeout` 旧超时；finalizeThinking 闭包内 `current === state` 身份验证；clearThinking 全路径清理 pending timeout | **通过** |
+| **P3** startThinking 未清理旧 setTimeout | 同上（与 P0 同一修复） | **通过** |
+| **P1** 暗色模式文字颜色失效 | 移除 `textColorClass` computed，模板改为 `text-#333 dark:text-[--text-color]` 直接绑定 | **通过** |
+| **P2-1** showThinkingPanel 与设计不一致 | 群聊中通过 `groupStore.getUserListByRoomId` 检查成员 `userType === 4`，有 aiclaw 时始终显示面板，防止 layout shift | **通过** |
+
+**复测结论**：P0/P1/P2-1/P3 修复逻辑全部正确，代码审查通过。深度 GUI 测试待测试账号到位后执行。
