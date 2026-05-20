@@ -188,7 +188,7 @@
    - Body 包含 `extra.thinkingId="999999999001"`
    - 请求到达 `ChatServiceImpl.sendMsg()` 第 82-92 行（M2-2 修复代码）
 
-### 6.2 复测结果
+### 6.2 首次复测结果（发现新缺陷）
 
 | 检查项 | 结果 | 说明 |
 |--------|------|------|
@@ -219,9 +219,29 @@ org.springframework.jdbc.BadSqlGrammarException:
 
 > **注意**：M3 新增的 `im_aiclaw_group_config` 表如同样继承 `SuperEntity` 但无 `tenant_id` 字段，也会触发相同问题，建议统一处理。
 
-### 6.4 复测结论
+### 6.4 二次复测（server-dev DDL 修复后）
 
-**M2-2 修复未通过。** 代码逻辑正确，但因 DDL 与实体基类不匹配导致 SQL 执行失败。修复后仅需重新部署并做一次消息发送验证即可。
+**修复 commit**：`c262b806`（补全 `tenant_id` DDL）
+**DDL 执行**：
+```sql
+ALTER TABLE hula.im_aiclaw_thinking ADD COLUMN tenant_id BIGINT NOT NULL DEFAULT 1 COMMENT '租户ID';
+ALTER TABLE hula.im_aiclaw_group_config ADD COLUMN tenant_id BIGINT NOT NULL DEFAULT 1 COMMENT '租户ID';
+```
+
+**测试数据**：
+- 请求：`POST /api/im/chat/msg`，body 含 `extra.thinkingId="999999999001"`
+- 返回 msgId：`163363355771392`
+
+| 检查项 | 结果 | DB 验证 |
+|--------|------|---------|
+| `extra.thinkingId` 读取 | ✅ 通过 | — |
+| `im_aiclaw_thinking_msg_rel` 写入 | ✅ **通过** | `thinking_id=999999999001, msg_id=163363355771392` |
+| `im_aiclaw_thinking.has_response` 更新 | ✅ **通过** | `has_response=1` |
+| WS extra 透传 | ✅ **通过**（代码审查） | `MsgSendConsumer` 第 140-143、154-157 行确认 `dto.getExtra()` 透传至 WS payload |
+
+### 6.5 复测结论
+
+✅ **M2-2 修复通过。** `thinking_msg_rel` 关联回写 + `has_response` 更新 + WS extra 透传均已验证成功。
 
 ---
 
@@ -229,5 +249,5 @@ org.springframework.jdbc.BadSqlGrammarException:
 
 | 角色 | 确认 |
 |------|------|
-| backend-tester | 测试执行完成，报告已提交 |
-| 下一步 | 等待 server-dev 修复 M2-2-fix `tenant_id` 缺失问题后重新复测 |
+| backend-tester | 测试执行完成，M2-2 复测通过 |
+| 下一步 | M2 全部 P0/P1 修复完成，可启动 M3 |
