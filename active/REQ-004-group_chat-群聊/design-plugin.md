@@ -2,18 +2,25 @@
 
 > Owner: plugin-dev
 > 日期：2026-05-20
-> 版本：v1.1（manager 初评后迭代）
+> 版本：v1.2（reviewer 评审后修订）
 > 阶段：详细设计
-> 输入：需求.md v2.1 + assessment-plugin-dev.md + design-tasks.md
+> 输入：需求.md v2.1 + assessment-plugin-dev.md + design-tasks.md + review-design-reviewer.md
 
-**变更日志（v1.0 → v1.1）：**
-- M1：确认采纳 A + 边界约束（§E.3）
-- M2：排查 openclaw sessionKey 行为，X6 关闭（§四.X6）
-- X1：triggerMsgId 统一为 string，aiclawName 从 server payload 移除（§F.2）
-- X2：autoReply 改走 WS payload only（manager 决策，§D.1 / §四.X2）
-- M3：群配置推送范围改为群内所有在线成员（§F.3 / §四.X5）
-- THINKING_DELTA/END payload 增加 roomId 字段（§F.2）
-- userType 确认：`im_user.user_type = 2` = 机器人（§A.4）
+**变更日志：**
+- v1.0 → v1.1：
+  - M1：确认采纳 A + 边界约束（§E.3）
+  - M2：排查 openclaw sessionKey 行为，X6 关闭（§四.X6）
+  - X1：triggerMsgId 统一为 string，aiclawName 从 server payload 移除（§F.2）
+  - X2：autoReply 改走 WS payload only（manager 决策，§D.1 / §四.X2）
+  - M3：群配置推送范围改为群内所有在线成员（§F.3 / §四.X5）
+  - THINKING_DELTA/END payload 增加 roomId 字段（§F.2）
+- v1.1 → v1.2（reviewer 修订）：
+  - **S3**：thinkingSessions 增加 5 分钟超时清理机制（§A.2 / §A.4）
+  - **S4**：标注 AntiLoopGuard 多实例状态不同步限制（§E.2）
+  - **S1**：明确 thinkingId 回传机制（server 广播 → plugin 自匹配）（§A.4 / §F.2）
+  - **S5**：`hula_send_message` Tool 增加可选 `thinkingId` 参数，用于 thinking_msg_rel 回写（§D.1）
+  - **I2**：修正 userType 判断值 `2` → `4`（AICLAW）（§A.4）
+  - **S2**：标注 server 在 THINKING_START 时做频率校验的协同点（§A.4 / §E.1）
 
 ---
 
@@ -164,7 +171,7 @@ private lastCtx: LastMessageContext | null;
 interface ThinkingSession {
   /** sessionKey: aiclaw-{uid}-room-{roomId} */
   sessionKey: string;
-  /** server 生成的 thinking 记录 ID（START 后由 server 返回） */
+  /** server 生成的 thinking 记录 ID（START 广播后由 plugin 自匹配提取） */
   thinkingId: string;
   /** 触发消息的 msgId */
   triggerMsgId: string;
@@ -174,23 +181,28 @@ interface ThinkingSession {
   seq: number;
   /** 思考内容累计（用于日志/debug） */
   accumulatedContent: string;
+  /** 超时清理定时器 ID */
+  timeoutId?: ReturnType<typeof setTimeout>;
 }
 
 class MessageHandler {
   // 替换 streaming boolean
   private thinkingSessions = new Map<string, ThinkingSession>();
-  
+
   // 保持 pendingMessages，但语义变为"thinking 期间排队"
   private pendingMessages: string[] = [];
-  
+
   // 保持 lastCtx，但扩展字段
   private lastCtx: LastMessageContext | null = null;
-  
+
   // 新增：防循环守卫
   private antiLoopGuard: AntiLoopGuard;
-  
+
   // 新增：群配置本地缓存
   private groupConfigCache: GroupConfigCache;
+
+  // 【S3】thinking session 超时时间（5 分钟）
+  private readonly THINKING_SESSION_TIMEOUT_MS = 5 * 60 * 1000;
 }
 ```
 
@@ -244,7 +256,7 @@ private handleReceiveMessage(data: ReceivedMessage): void {
   }
   
   // 6. 【新增】AI 互触发检查
-  const isFromAi = data.fromUser.userType === 2; // 2=机器人（已确认 im_user.user_type 枚举）
+  const isFromAi = data.fromUser.userType === 4; // 4=AICLAW（UserTypeEnum.AICLAW = 4，已 server-dev 确认）
   const config = this.groupConfigCache.get(this.selfUid, roomId);
   if (isFromAi && !config?.respondToAi) {
     console.log(`[handler] Skipping AI message (respondToAi=false)`);
@@ -299,52 +311,70 @@ private async triggerAgentLoop(message: string): Promise<void> {
     console.warn('[handler] WS not connected, dropping AI request');
     return;
   }
-  
+
   if (!this.lastCtx) {
     console.warn('[handler] No message context, dropping AI request');
     return;
   }
-  
+
   const { roomId, fromUid, msgId } = this.lastCtx;
   const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
-  
+
   // 检查 session 是否已存在（并发防护）
   if (this.thinkingSessions.has(sessionKey)) {
     console.warn(`[handler] Thinking session already active for ${sessionKey}`);
     return;
   }
-  
-  // 创建 thinking session
+
+  // 【S3】创建 thinking session（thinkingId 初始为空，等 server 广播回填）
   const session: ThinkingSession = {
     sessionKey,
+    thinkingId: '',
     triggerMsgId: msgId,
     startTime: Date.now(),
     seq: 0,
     accumulatedContent: '',
   };
+
+  // 【S3】设置 5 分钟超时定时器
+  session.timeoutId = setTimeout(() => {
+    console.error(`[thinking] timeout session=${sessionKey} after ${this.THINKING_SESSION_TIMEOUT_MS}ms`);
+    this.ws.send(WSReqType.THINKING_END, {
+      thinkingId: session.thinkingId || undefined,
+      durationMs: Date.now() - session.startTime,
+      error: 'thinking_session_timeout',
+    });
+    this.thinkingSessions.delete(sessionKey);
+    this.flushPendingMessages();
+  }, this.THINKING_SESSION_TIMEOUT_MS);
+
   this.thinkingSessions.set(sessionKey, session);
-  
+
   console.log(`[thinking] start msgId=${msgId} sessionKey=${sessionKey}`);
-  
-  // 发送 THINKING_START
+
+  // 【S2】发送 THINKING_START；server 会在此处做频率校验
+  // 若超限，server 返回 THINKING_END { error: 'rate_limit_exceeded' }，plugin 据此跳过 adapter.chat()
   this.ws.send(WSReqType.THINKING_START, {
     fromUid: this.selfUid,
     roomId,
     triggerMsgId: msgId,
   });
-  
+
   const callbacks: ThinkingCallbacks = {
     onThinkingDelta: (chunk) => {
       session.seq++;
       session.accumulatedContent += chunk;
       this.ws.send(WSReqType.THINKING_DELTA, {
+        thinkingId: session.thinkingId || undefined,
         chunk,
         seq: session.seq,
       });
       console.log(`[thinking] delta session=${sessionKey} seq=${session.seq} chunkLen=${chunk.length}`);
     },
     onThinkingEnd: (durationMs) => {
+      if (session.timeoutId) clearTimeout(session.timeoutId);
       this.ws.send(WSReqType.THINKING_END, {
+        thinkingId: session.thinkingId || undefined,
         durationMs,
       });
       console.log(`[thinking] end session=${sessionKey} durationMs=${durationMs}`);
@@ -352,8 +382,10 @@ private async triggerAgentLoop(message: string): Promise<void> {
       this.flushPendingMessages();
     },
     onError: (error) => {
+      if (session.timeoutId) clearTimeout(session.timeoutId);
       console.error(`[thinking] error session=${sessionKey} reason=${error.message}`);
       this.ws.send(WSReqType.THINKING_END, {
+        thinkingId: session.thinkingId || undefined,
         durationMs: Date.now() - session.startTime,
         error: error.message,
       });
@@ -361,8 +393,34 @@ private async triggerAgentLoop(message: string): Promise<void> {
       this.flushPendingMessages();
     },
   };
-  
+
   await this.adapter.chat(message, sessionKey, callbacks);
+}
+
+/** 【S1】接收 server 的 thinkingStart 广播，回填 thinkingId */
+private handleThinkingStartBroadcast(data: ThinkingStartDTO): void {
+  const { fromUid, roomId, triggerMsgId } = data;
+
+  // 只处理自己发起的 thinking（server 广播给全员，通过 fromUid 过滤）
+  if (fromUid !== this.selfUid) return;
+
+  const sessionKey = `aiclaw-${this.selfUid}-room-${roomId}`;
+  const session = this.thinkingSessions.get(sessionKey);
+  if (!session) {
+    console.warn(`[thinking] received thinkingStart broadcast but no active session for ${sessionKey}`);
+    return;
+  }
+
+  // 校验 triggerMsgId 匹配，防止旧广播误匹配
+  if (session.triggerMsgId !== triggerMsgId) {
+    console.warn(`[thinking] triggerMsgId mismatch: session=${session.triggerMsgId}, broadcast=${triggerMsgId}`);
+    return;
+  }
+
+  // 回填 thinkingId（server 生成，String 类型）
+  // 注：broadcast payload 中的 thinkingId 字段需 server-dev 在 §S1 中实现
+  session.thinkingId = (data as any).thinkingId || '';
+  console.log(`[thinking] thinkingId backfilled: ${session.thinkingId} for ${sessionKey}`);
 }
 ```
 
@@ -588,7 +646,7 @@ const schema = {
 };
 ```
 
-**扩展后：**
+**扩展后（S5：增加 thinkingId 用于 thinking_msg_rel 回写）：**
 
 ```ts
 const schema = {
@@ -599,7 +657,7 @@ const schema = {
     extra: Type.Optional(
       Type.Object(
         {},
-        { description: '额外字段（如 { autoReply: true }），server 侧不入库，仅在 WS 推送时携带' }
+        { description: '额外字段（autoReply?: boolean; thinkingId?: string），server 侧不入库，仅在 WS 推送 / thinking_msg_rel 回写时使用' }
       )
     ),
   },
@@ -610,18 +668,34 @@ const schema = {
 **execute 逻辑：**
 
 ```ts
-async execute(params: Record<string, unknown>) {
+async execute(params: Record<string, unknown>, context?: ToolExecutionContext) {
   const roomId = params.roomId as number;
   const content = params.content as string;
-  const extra = params.extra as Record<string, unknown> | undefined;
-  
+  const extra = (params.extra as Record<string, unknown>) || {};
+
   if (!roomId) return { error: '房间 ID 不能为空' };
   if (!content?.trim()) return { error: '消息内容不能为空' };
-  
+
+  // 【S5】尝试从 Tool execution context 获取当前 thinkingId
+  // 优先：openclaw context 传递的 thinkingId
+  // 次选：aichat-claw 实例池按 sessionKey 维护的 activeThinkingId（方案 B 保底）
+  const thinkingId = context?.thinkingId
+    || this.activeThinkingIds.get(context?.sessionKey)
+    || undefined;
+
+  if (thinkingId) {
+    extra.thinkingId = thinkingId;
+  }
+
   const result = await api.sendMessage(roomId, content, extra);
   return { ok: true, msgId: result.msgId };
 }
 ```
+
+**S5 对齐结论（与 server-dev 确认）：**
+- `hula_send_message` REST body 的 `extra.thinkingId` 字段被 server 读取
+- server 收到后：写入 `im_message` + `im_aiclaw_thinking_msg_rel` + 更新 `im_aiclaw_thinking.has_response = 1`
+- 若 aichat-claw 未传 thinkingId（如 openclaw context 不支持），server 按 `(aiclawUid, roomId)` 查最近 active thinking 做 fallback 关联
 
 #### D.2 HulaApiClient.sendMessage 扩展
 
@@ -852,6 +926,14 @@ export class AntiLoopGuard {
 }
 ```
 
+**【S4】多实例部署限制（标注）：**
+
+`AntiLoopGuard` 的 `roomStates` 和 `aiRoundCount` 维护在**单 aichat-node 进程内存**中。如果同一 aiclaw 运行多个 aichat-node 实例（水平扩展）：
+- 各实例的 `aiRoundCount` 互不同步，指数退避效果减弱
+- `recentReplyLengths`  likewise 不同步
+
+**当前部署假设**：每个 aiclaw 仅运行一个 aichat-node 进程（单实例）。若未来需水平扩展，需引入 Redis 或共享存储同步 `aiRoundCount`。
+
 #### E.3 autoReply 发送逻辑（M1 已定案）
 
 **决策：采纳方案 A**（manager 决策）
@@ -922,13 +1004,14 @@ export type WSRespType =
 **plugins → server（WSReqTypeEnum）：**
 
 ```ts
-// THINKING_START (20)
+// THINKING_START (20) — plugin → server
 interface ThinkingStartPayload {
   fromUid: number;        // aiclaw 的 uid
   roomId: number;         // 群聊房间 ID
   triggerMsgId: string;   // 触发本次思考的消息 ID
 }
-// → server 返回: { thinkingId, fromUid, roomId, triggerMsgId }
+// 【S1】server 创建记录后，通过 thinkingStart 广播（server→client）回传 thinkingId
+// plugin 收到广播后通过 fromUid === selfUid 匹配，提取 thinkingId 存入 ThinkingSession
 
 // THINKING_DELTA (21)
 interface ThinkingDeltaPayload {
@@ -950,11 +1033,12 @@ interface ThinkingEndPayload {
 **server → client（WSRespTypeEnum）：**
 
 ```ts
-// thinkingStart
+// thinkingStart — server → client（广播，含 plugin 自身）
 interface ThinkingStartDTO {
   fromUid: number;
   roomId: number;
   triggerMsgId: string;
+  thinkingId: string;     // 【S1】server 生成的 thinking 记录 ID，plugin 自匹配回填
   // aiclawName 由前端通过 fromUid 查本地用户缓存获取，server 不携带
 }
 
@@ -997,6 +1081,10 @@ interface GroupConfigUpdateDTO {
 
 ```ts
 // MessageHandler.handle()
+case 'thinkingStart':
+  this.handleThinkingStartBroadcast(msg.data as ThinkingStartDTO);
+  break;
+
 case 'groupConfigUpdate':
   const update = msg.data as GroupConfigUpdateDTO;
   if (update.aiclawUid === this.selfUid) {
@@ -1175,13 +1263,14 @@ function resolveToken(): string {
 | plugin→server | 20 THINKING_START | fromUid, roomId, triggerMsgId | triggerMsgId: **string**（BIGINT 精度安全） |
 | plugin→server | 21 THINKING_DELTA | thinkingId, chunk, seq, roomId? | roomId 冗余，方便调试 |
 | plugin→server | 22 THINKING_END | thinkingId, durationMs, error?, roomId? | thinkingId 由 server 在 START 时返回 |
-| server→client | thinkingStart | fromUid, roomId, triggerMsgId | aiclawName 由前端本地缓存查 |
+| server→client | thinkingStart | fromUid, roomId, triggerMsgId, **thinkingId** | 【S1】server 广播回传 thinkingId，plugin 自匹配 |
 | server→client | thinkingDelta | fromUid, roomId, chunk, seq | |
 | server→client | thinkingEnd | fromUid, roomId, durationMs, error? | |
 
 **关键结论：**
 - `triggerMsgId` 统一为 **string**（避免 JS/TS BIGINT 精度丢失）
-- THINKING_DELTA/END 携带 `thinkingId`（server 分配的 thinking 记录主键），server 从 `im_aiclaw_thinking` 反查 roomId 做路由
+- **【S1】thinkingId 由 server 生成，通过 thinkingStart 广播回传**。plugin 发送 THINKING_START 时 thinkingId 为空，收到广播后通过 `fromUid === selfUid` 匹配回填
+- THINKING_DELTA/END 携带 `thinkingId`（server 分配的 thinking 记录主键）；若尚未收到广播，传空或 undefined，server 按 `(fromUid, roomId)` fallback 查 active thinking
 - `roomId` 作为可选冗余字段携带，减少 server 一次 DB 查询
 
 ### X2. autoReply 载体 ✅ 已定案
@@ -1211,9 +1300,11 @@ function resolveToken(): string {
 - 优先方案 A：依赖 openclaw Tool execution context 传递 agent credential
 - 备选方案 B：aichat-claw 维护 `Map<aiclawUid, HulaApiClient>` 实例池
 
+**S5 对齐结论（见 §D.1）**：`hula_send_message` extra 字段同时承载 `autoReply` 和 `thinkingId`，server 侧从 `extra.thinkingId` 读取后写 `im_aiclaw_thinking_msg_rel` + 更新 `has_response`。
+
 **待 server-dev 确认：**
-- openclaw gateway 在 Tool execute 时是否提供 agent token/session
-- 如不提供，openclaw 是否至少提供 `aiclawUid`
+- openclaw gateway 在 Tool execute 时是否提供 agent token/session/sessionKey
+- 如不提供，openclaw 是否至少提供 `aiclawUid`（用于方案 B 实例池）
 
 ### X5. 群配置 WS 通知 payload ✅ 已定案
 
@@ -1265,6 +1356,8 @@ interface GroupConfigUpdateDTO {
 | R3 | 低 | THINKING payload 字段与 server 不一致 | 设计阶段对齐，若不一致按 server 为准调整 |
 | R4 | 低 | aichat-node 内存层状态丢失（重启） | 可接受：AI-to-AI 计数器重置，短暂高频后恢复退避 |
 | R5 | 低 | 群配置 API 延迟导致限流失效 | server 层做兜底，node 层提前拒绝 |
+| **R6** | **低** | **【S3】thinking session 超时（5min）可能误杀长思考** | 可接受：正常 agent loop 通常在 30s-2min 内完成；若确实需更长，可配置化超时阈值 |
+| **R7** | **低** | **【S4】多实例部署时 aiRoundCount 不同步** | 当前按单实例部署；若需扩展，引入 Redis 同步（+0.5d） |
 
 ---
 
@@ -1314,6 +1407,17 @@ interface GroupConfigUpdateDTO {
 | **M1** | aichat-node 发送 autoReply 的路径 | **采纳 A**：内嵌轻量 HulaApiClient | manager 决策，边界约束见 §E.3 |
 | **M2** | 上下文窗口维护归属 | **X6 关闭**：openclaw 已通过 sessionKey 维护 history | openclaw session-memory hook 启用 + 会话 jsonl 文件实证 |
 | **M3** | 群配置 WS 通知推送范围 | **群内所有在线成员 + aichat-node** | manager 决策 |
+
+**Reviewer 修订项（v1.1 → v1.2）：**
+
+| 编号 | 级别 | 内容 | 处理位置 |
+|------|------|------|----------|
+| S3 | Should-fix | thinkingSessions 超时清理（5 分钟） | §A.2 / §A.4 |
+| S4 | Should-fix | AntiLoopGuard 多实例状态不同步（标注限制） | §E.2 |
+| S1 | Should-fix | thinkingId 回传机制（广播自匹配） | §A.4 / §F.2 / §四.X1 |
+| S5 | Should-fix | thinking_msg_rel 回写（extra.thinkingId） | §D.1 |
+| I2 | Info | userType 判断值修正（2→4） | §A.4 |
+| S2 | Should-fix | server THINKING_START 前置频率校验（协同点） | §A.4 注释标注 |
 
 **当前开放问题（无阻塞）：**
 
