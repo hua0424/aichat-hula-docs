@@ -2,7 +2,7 @@
 
 > 编写：frontend-dev
 > 日期：2026-05-20
-> 版本：v1.1（跨组对齐 + manager 决策修订）
+> 版本：v1.2（reviewer 评审通过，仅 1 处笔误修正）
 > 输入：需求.md v2.1 + feasibility-frontend.md + design-tasks.md §2.3 + manager D1-D4 决策 + server-dev/plugin-dev 跨组对齐
 > 关联：design-server.md (server-dev) / design-plugin.md (plugin-dev)
 >
@@ -109,7 +109,7 @@ AICLAW_GROUP_CONFIG_UPDATE = 'aiclawGroupConfigUpdate',
 
 /** 思考开始 payload（server → client） */
 export type ThinkingStartPayload = {
-  /** 思考会话 ID（由 aichat-node 生成，全局唯一） */
+  /** 思考会话 ID（由 server 生成，im_aiclaw_thinking 自增主键序列化为 string） */
   thinkingId: string
   /** aiclaw 用户 ID */
   fromUid: number
