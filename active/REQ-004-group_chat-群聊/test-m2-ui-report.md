@@ -123,6 +123,8 @@ AICLAW_GROUP_CONFIG_UPDATE = 'groupConfigChange'
 
 设计文档 §3.1 中描述为 `'aiclawGroupConfigUpdate'`。虽然 commit `01e152d69` 已修正为 `'groupConfigChange'`，但需与 server-dev 确认后端实际发送的 WS type 字符串，避免两端不匹配导致事件丢失。
 
+**【勘误】**：经 manager 确认，M1 已在 `01e152d69` 修正为 `'groupConfigChange'` 并与 server-dev 对齐。**此条为误报**（混淆了变量名 `AICLAW_GROUP_CONFIG_UPDATE` 与其实际值），frontend-dev 无需修改。
+
 ---
 
 ### P3 — Transition mode="out-in" 切换空白
