@@ -280,6 +280,47 @@ M4 联调 + 验收 + bugfix (~3-5d)
 [REQ-004 M2] 已完成 P-M2-1 MessageHandler 重构，正在做 P-M2-2 thinkingId 回填，预计今天结束。
 ```
 
+### 7.1.1 ⚠️ 每天开工前必做：拉取最新
+
+**每天开始工作前，必须执行：**
+
+```bash
+# 1. 拉取各自代码仓库的 group_chat 分支
+cd <your_repo>           # HuLa-Server / aichat-plugins / HuLa
+git checkout group_chat
+git pull origin group_chat
+
+# 2. 拉取 teamdocs 子模块的 group_chat 分支
+cd teamdocs              # 进入子模块目录
+git checkout group_chat  # 确保在 group_chat 分支（而非 detached HEAD）
+git pull origin group_chat
+cd ..
+```
+
+理由：teamdocs 和各仓库的 group_chat 是多人共同写入的活跃分支，启动当天的工作前必须同步最新，否则会出现：
+- 看到的设计文档不是最新版本，按过时设计实现
+- 提交时 push 失败，需要 rebase/merge
+- 与其他人的改动冲突
+
+### 7.1.2 ⚠️ 修改 teamdocs 后立即 push + 通知
+
+**任何对 teamdocs 的改动**（包括但不限于：设计文档迭代、状态更新、bug 备忘、回顾纪要），完成后必须立即：
+
+```bash
+cd teamdocs
+git add <修改的文件>
+git commit -m "REQ-004(<里程碑>): <模块> <内容>"
+git push origin group_chat
+```
+
+并且通过 `send_message` 通知其他相关方拉取最新，例如：
+
+```
+@plugin-dev @frontend-dev：teamdocs design-server.md 已更新 §3.3.2（commit XXX），请 git pull 同步。
+```
+
+避免出现某人按旧版本设计开发但其他人已经迭代过设计的情况。
+
 ### 7.2 阻塞响应
 
 - 跨组依赖阻塞：直接 `send_message` 给对方，抄送 manager
