@@ -3,7 +3,7 @@
 > Owner: server-dev  
 > 输入: [需求.md](需求.md) v2.1 + design-tasks.md §2.1  
 > 日期: 2026-05-20  
-> 状态: v1.3（M1-fix：Entity-DB 对齐 + THINKING_END status 字段）
+> 状态: v1.4（M3：短回复 skip 服务端权威层）
 
 ---
 
@@ -620,6 +620,53 @@ WHERE from_uid = #{aiclawUid}
 - aichat-node 收到 429 后，自动构造限流说明消息
 - 消息 WS payload 携带 `autoReply: true`
 - 该消息**不计入**限流统计（避免恶性循环）
+
+#### 3.4.4 短回复 skip（服务端权威层）
+
+**背景**：aichat-node 与 aichat-claw 不在同一进程（node 为 WS 客户端，claw 为 openclaw 插件），plugin 端无法可靠维护短回复状态 → 上收至 server 权威层。
+
+**触发时机**：`ChatServiceImpl.sendMsg()` 在 `checkAndSaveMsg()` **之前**执行，避免短回复落库。
+
+**算法**：
+```java
+// 仅当发送者为 aiclaw (userType=4) 且在群聊中时检查
+if (sender.userType != 4 || !room.isRoomGroup()) return;
+
+// 读取群配置（无记录用默认值：threshold=10, lookback=3）
+int threshold = config.shortReplyThreshold;   // 短回复阈值（字符数）
+int lookback  = config.shortReplyLookback;    // 检查最近 N 条
+
+// 查询该 aiclaw 在该群最近 N 条消息的内容长度
+List<Integer> lengths = messageMapper.selectRecentMsgLengths(
+    aiclawUid, roomId, lookback);
+
+// 最近 N 条全部 < threshold → 拒绝
+if (lengths.size() >= lookback && lengths.stream().allMatch(l -> l < threshold)) {
+    // 有 thinkingId 时 WS 广播 thinkingEnd(error=short_reply_skip)
+    // 然后抛 BizException("short_reply_skip")
+}
+```
+
+**SQL**：
+```sql
+SELECT CHAR_LENGTH(content) AS msg_length
+FROM im_message
+WHERE from_uid = #{fromUid} AND room_id = #{roomId} AND status = 0
+ORDER BY create_time DESC, id DESC
+LIMIT #{limit}
+```
+
+**拒绝路径**：
+1. `sendMsg()` 中抛 `BizException("short_reply_skip")`
+2. 若 `request.extra.thinkingId` 存在，先 `PushService.sendPushMsg()` 广播 `thinkingEnd(status=error, error="short_reply_skip")` 给群成员
+3. aichat-node 收到 `thinkingEnd(error=short_reply_skip)` 后触发 `sendAutoReply`
+
+**Error Code 约定**（供 plugin-dev 参考）：
+| Error Code | 场景 | 触发位置 |
+|-----------|------|---------|
+| `rate_limit_exceeded` | 频率超限（10条/分钟） | ws-biz ThinkingProcessor |
+| `daily_limit_exceeded` | 日限超限（1000条） | ws-biz ThinkingProcessor |
+| `short_reply_skip` | 连续短回复跳过 | im-biz ChatServiceImpl |
 
 ---
 
