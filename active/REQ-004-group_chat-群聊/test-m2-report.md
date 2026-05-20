@@ -170,9 +170,64 @@
 
 ---
 
+## 六、M2-2 复测报告（2026-05-20）
+
+> 测试方：backend-tester
+> 修复 commit：`19035938`
+> 部署状态：已构建 `luohuo-im-server.jar` 并替换 runtime 容器，IM 服务重启正常
+
+### 6.1 复测步骤
+
+1. **登录获取 token**：
+   - 通过 `/api/oauth/anyTenant/login` 成功获取 token
+   - 正确 clientId：`luohuo_web`，clientSecret：`luohuo_web_secret`（来自 `def_client` 初始化 SQL）
+   - 测试账号：`15147891644` / `123456` → token=`cab76058-656a-43c1-b503-6e1ec3a2d43d`
+
+2. **调用消息发送 API**：
+   - `POST /api/im/chat/msg`，Header 携带 `token: <token>`
+   - Body 包含 `extra.thinkingId="999999999001"`
+   - 请求到达 `ChatServiceImpl.sendMsg()` 第 82-92 行（M2-2 修复代码）
+
+### 6.2 复测结果
+
+| 检查项 | 结果 | 说明 |
+|--------|------|------|
+| `extra.thinkingId` 读取 | ✅ 通过 | `ChatServiceImpl` 正确解析 `request.getExtra().get("thinkingId")` |
+| `im_aiclaw_thinking_msg_rel` 写入 | ⚠️ **无法确认** | `insertIgnore(rel)` 在 `updateHasResponse` 异常前执行，但整事务回滚 |
+| `im_aiclaw_thinking.has_response` 更新 | ❌ **失败** | `updateHasResponse` 抛出 `BadSqlGrammarException` |
+| WS extra 透传 | ⚠️ 未验证 | 消息发送失败，未进入 WS 推送阶段 |
+
+### 6.3 发现的新缺陷（M2-2-fix）
+
+**问题：** `AiclawThinkingMapper.updateHasResponse()` 执行时 MyBatis-Plus 租户拦截器自动注入 `AND tenant_id = 1`，但 `im_aiclaw_thinking` 表无 `tenant_id` 字段。
+
+**异常栈：**
+```
+org.springframework.jdbc.BadSqlGrammarException:
+### SQL: UPDATE im_aiclaw_thinking SET has_response = ? WHERE id = ? AND tenant_id = 1
+### Cause: java.sql.SQLSyntaxErrorException: Unknown column 'tenant_id' in 'where clause'
+```
+
+**根因分析：**
+- `AiclawThinking` 实体继承 `SuperEntity<Long>`，MyBatis-Plus `TenantLineInnerInterceptor` 对所有继承 `SuperEntity` 的表自动追加租户条件
+- 但 `im_aiclaw_thinking` DDL（`req-004-group-chat.sql`）未包含 `tenant_id` 字段
+- 同文件中的 `im_aiclaw_thinking_msg_rel` 表无此问题（不继承 `SuperEntity`，Mapper 也不继承 `BaseMapper`）
+
+**修复建议（二选一）：**
+1. **DDL 补全**：在 `im_aiclaw_thinking` 表增加 `tenant_id BIGINT DEFAULT 1` 字段，与 `SuperEntity` 语义对齐
+2. **拦截器忽略**：在 MyBatis-Plus 租户拦截器配置中将 `im_aiclaw_thinking` 加入忽略表名单
+
+> **注意**：M3 新增的 `im_aiclaw_group_config` 表如同样继承 `SuperEntity` 但无 `tenant_id` 字段，也会触发相同问题，建议统一处理。
+
+### 6.4 复测结论
+
+**M2-2 修复未通过。** 代码逻辑正确，但因 DDL 与实体基类不匹配导致 SQL 执行失败。修复后仅需重新部署并做一次消息发送验证即可。
+
+---
+
 ## 五、签名
 
 | 角色 | 确认 |
 |------|------|
 | backend-tester | 测试执行完成，报告已提交 |
-| 下一步 | 等待 server-dev 实现 M2-2 `thinking_msg_rel` 关联回写 |
+| 下一步 | 等待 server-dev 修复 M2-2-fix `tenant_id` 缺失问题后重新复测 |
