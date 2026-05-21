@@ -3,7 +3,7 @@
 > Owner: server-dev  
 > 输入: [需求.md](需求.md) v2.1 + design-tasks.md §2.1  
 > 日期: 2026-05-20  
-> 状态: v1.5（M4：限流 thinkingId 修复 + extra 层级精确化）
+> 状态: v1.6（M4 收尾：cleanupSession 修复 + RateLimitChecker Redis 缓存 + thinkingId fallback + API 路径补全）
 
 ---
 
@@ -258,6 +258,20 @@ public class AiclawGroupConfigController {
 - `GET`：群成员可查询（用于前端展示）
 - `PUT`：仅 aiclaw 主人（通过 aiclaw_uid → owner_uid 映射校验）
 
+**完整 API 路径（经 Gateway 路由）**：
+
+| 内部路径 | Gateway 路径 | 说明 |
+|---------|-------------|------|
+| `GET /aiclaw/group/config` | `GET /api/im/aiclaw/group/config` | 查询群配置 |
+| `PUT /aiclaw/group/config` | `PUT /api/im/aiclaw/group/config` | 更新群配置 |
+| `POST /thinking/start` | 不暴露（ws-server 内部调用） | 创建 thinking 记录 |
+| `POST /thinking/delta` | 不暴露 | 追加 delta |
+| `POST /thinking/end` | 不暴露 | 结束 thinking |
+| `POST /thinking/error` | 不暴露 | 标记 thinking 错误 |
+| `GET /thinking/room/{roomId}/members` | 不暴露 | 查询群成员列表 |
+
+> Gateway 路由规则：`/api/im/**` → `lb://luohuo-im-server`，StripPrefix=1
+
 **Request / Response DTO：**
 
 ```java
@@ -406,6 +420,15 @@ plugins (aichat-node)
 - **方案**：server 将 thinkingId 放入 thinkingStart **广播 payload**（server→client 方向），群内所有成员（含该 aiclaw 自己）都能收到
 - plugin 侧收到 thinkingStart 后，通过匹配 `fromUid === selfUid` 识别是自己的 session，从中提取 `thinkingId`
 - 后续 THINKING_DELTA/END 的入参携带该 `thinkingId`，server 通过 thinkingId 反查 roomId 和 thinking 记录
+
+**thinkingId fallback 索引（M4 收尾）：**
+- 由于 race condition（openclaw 在 thinkingStart 广播到达前就产生 delta），plugin 可能发出 `thinkingId` 为空的 THINKING_DELTA/END
+- **server-side fallback**：`ThinkingProcessor` 维护二级索引 `ConcurrentHashMap<aiclawUid:roomId, thinkingId>`
+  - `handleStart` 创建 thinking 时写入索引
+  - `handleDelta`/`handleEnd` 收到空 thinkingId 时，用 `req.getRoomId()` + `aiclawUid` 反查
+  - 反查成功则正常处理，仍失败才丢弃
+  - `handleEnd` / 超时扫描清理索引
+- **plugin-side 双重保险**：aichat-node 内部维护 `pendingDeltas` 缓冲，待 thinkingId 回填后补发
 
 **频率校验前置（S2）—— M4 修正：**
 - THINKING_START Handler 中**先创建 thinking 记录生成 thinkingId**，再做频率校验（Redis 滑动窗口计数器）
@@ -558,13 +581,83 @@ public static class Message {
 
 > ✅ **跨组对齐（X2）已确认**：server-dev + plugin-dev + frontend-dev 三方一致。
 
+#### 3.3.5 WS Session 清理修复（M4 收尾）
+
+**问题**：WS 断开后 `USER_DEVICE_SESSION_MAP` / `SESSION_USER_MAP` / `SESSION_CLIENT_MAP` 未清理，导致死会话残留、推送路由无效、RetryPushConsumer 反复重推。
+
+**根因**：`SessionManager.cleanupSession()` 的 guard 条件 `if (!session.isOpen())` 导致从 `ReactiveWebSocketHandler.doFinally` 调用时**永远跳过清理**（doFinally 时 session 仍 open）。
+
+```java
+// BUG: doFinally 时 session 仍 open → !isOpen() = false → 整个 cleanup 被跳过
+public void cleanupSession(WebSocketSession session) {
+    if (session != null && !session.isOpen()) {  // ← 永远 false
+        session.close(...).doAfterTerminate(() -> { /* 清理 maps */ }).subscribe();
+    }
+}
+```
+
+**修复**：始终执行清理，如 session 仍 open 则先 close 再清理 maps：
+
+```java
+public void cleanupSession(WebSocketSession session) {
+    if (session == null) return;
+    Mono<Void> closeMono = session.isOpen()
+            ? session.close(CloseStatus.GOING_AWAY)
+            : Mono.empty();
+    closeMono.subscribeOn(Schedulers.boundedElastic())
+            .doAfterTerminate(() -> {
+                // 始终清理 maps（SESSION_CLIENT_MAP / SESSION_USER_MAP / USER_DEVICE_SESSION_MAP）
+                String clientId = SESSION_CLIENT_MAP.remove(sessionId);
+                Long uid = SESSION_USER_MAP.remove(sessionId);
+                if (clientId != null && uid != null) {
+                    boolean isLastSession = cleanDeviceSession(uid, clientId, sessionId);
+                    if (isLastSession) {
+                        nacosSessionRegistry.removeDeviceRoute(uid, clientId);
+                        syncOnline(uid, clientId, false);
+                    }
+                }
+            }).subscribe();
+}
+```
+
+**影响范围**：所有 WS 客户端断连场景（正常 close / 心跳超时 / 网络异常 / token 过期），修复前均存在 map 残留。
+
+> ⚠️ RetryPushConsumer 实际有 `maxReconsumeTimes = 3`（RocketMQ 限制），并非无限重试。但死会话导致每条消息都触发 1 次无效 retry，放大了表象。
+
 ---
 
 ### 3.4 防循环 DB 权威层
 
-#### 3.4.1 频率限制（10 条/分钟）
+> **M4 收尾更新**：`AiclawRateLimitChecker` 已改为从 Redis 群配置缓存读取 `rateLimitPerMinute` / `dailyLimit`，fallback 到默认值（10/1000）。不再 hardcode。详见 §3.4.1。
+
+#### 3.4.1 频率限制（默认 10 条/分钟，可配置）
 
 **主校验：Redis 滑动窗口计数器**
+
+**限流阈值来源（M4 收尾修正）**：`AiclawRateLimitChecker.check()` 从 Redis 群配置缓存读取 `rateLimitPerMinute` / `dailyLimit`，不再 hardcode 默认值。
+
+```java
+// AiclawRateLimitChecker — 限流配置读取链路
+private Config resolveConfig(Long aiclawUid, Long roomId) {
+    try {
+        String cacheKey = "im:aiclaw:group:config:" + aiclawUid + ":" + roomId;
+        Object cached = redisTemplate.opsForValue().get(cacheKey);
+        if (cached != null) {
+            JSONObject json = JSONUtil.parseObj(cached.toString());
+            return new Config(
+                json.getInt("rateLimitPerMinute", DEFAULT_RATE_LIMIT),  // 10
+                json.getInt("dailyLimit", DEFAULT_DAILY_LIMIT));        // 1000
+        }
+    } catch (Exception e) {
+        log.warn("Failed to resolve aiclaw config from Redis: ...", e);
+    }
+    return new Config(DEFAULT_RATE_LIMIT, DEFAULT_DAILY_LIMIT);  // fallback
+}
+```
+
+配置缓存由 `AiclawGroupConfigServiceImpl` 维护：
+- `getConfig()` 读 DB 后写入 Redis（TTL 30min）
+- `updateConfig()` 更新 DB 后刷新 Redis 缓存
 
 ```
 Key: im:aiclaw:rate:{aiclawUid}:{roomId}:{yyyyMMddHHmm}  → int
@@ -692,7 +785,7 @@ LIMIT #{limit}
 ```
 # 群级配置缓存
 im:aiclaw:group:config:{aiclawUid}:{roomId}  → JSON(AiclawGroupConfig)
-TTL: 1h（配置变更时主动失效）
+TTL: 30min（配置变更时主动刷新）
 
 # aiclaw 主人关系缓存（用于权限校验）
 im:aiclaw:owner:{aiclawUid}  → ownerUid
@@ -725,7 +818,7 @@ public class AiclawGroupConfigCacheKeyBuilder implements CacheKeyBuilder {
 }
 ```
 
-#### 3.5.2 配置更新后失效 + WS 广播
+#### 3.5.2 配置更新后刷新 + WS 广播
 
 ```java
 @Transactional
@@ -733,8 +826,10 @@ public void updateConfig(AiclawGroupConfigUpdateReq req) {
     // 1. 更新 DB
     configDao.updateById(...);
 
-    // 2. 失效 Redis 缓存
-    cacheOps.del(configKeyBuilder.key(req.getAiclawUid(), req.getRoomId()));
+    // 2. 刷新 Redis 缓存（更新而非删除，避免穿透）
+    AiclawGroupConfigResp cachedResp = BeanUtil.copyProperties(config, AiclawGroupConfigResp.class);
+    stringRedisTemplate.opsForValue().set(
+        buildConfigCacheKey(aiclawUid, roomId), JSONUtil.toJsonStr(cachedResp), CONFIG_CACHE_TTL);
 
     // 3. WS 广播配置变更
     pushService.sendPushMsg(
@@ -887,7 +982,7 @@ public class ThinkingEventHandler {
 | X1 | THINKING WS payload 字段 | payload 含 `fromUid`/`thinkingId`/`roomId`/`triggerMsgId`/`seq`/`durationMs`/`error?`；WS 中 ID 统一 String 类型 | ✅ 已对齐 |
 | X2 | autoReply 载体 | **extra 包裹方案**（`extra: { autoReply: true }`），WS payload only，不落库 | ✅ 已对齐 |
 | X3 | 防循环分层 | server 提供 Redis 计数器（频率/日限）+ DB 对账；aichat-node 做内存层（互触发/短回复/退避） | ✅ 已对齐 |
-| X4 | aichat-claw Token 上下文 | aiclaw 独立 token（`connectionToken`）鉴权；群配置 PUT 校验 owner/aiclaw 本人 | ✅ 已对齐 |
+| X4 | aichat-claw Token 上下文 | aiclaw 独立 token（`connectionToken`）鉴权；群配置 PUT 校验 owner/aiclaw 本人 | ⚠️ 已知限制：OpenclawAdapter 未传 thinkingId 给 openclaw gateway → `has_response=0`，需 4 层联动修，后续迭代 |
 | X5 | 群配置 WS 通知 payload | `WSGroupConfigChange` 含全部配置字段，推送群内**所有在线成员** + aichat-node | ✅ 已对齐 |
 | X6 | 上下文窗口归属 | **不需要 server 提供**，openclaw 自身维护 conversation history | ✅ 已关闭 |
 
@@ -899,6 +994,8 @@ public class ThinkingEventHandler {
 |------|------|------|---------|
 | 高频群 COUNT(*) 性能问题 | 🔶 中 | 防循环 SQL 慢查询 | 切换为 Redis 滑动窗口计数器，DB 仅做对账 |
 | 多 aiclaw 并发 thinking 串流 | 🔶 中 | 前端显示混乱 | thinking WS payload 必须含 `aiclawUid`，前端按 uid 隔离 thinking 状态 |
+| WS session 断连清理失败 | 🔴 高 | 死会话残留、推送路由无效、retry 浪费 | M4 已修：`cleanupSession` 去掉 `!isOpen()` guard，始终清理 maps |
+| runtime JAR 版本管理 | 🔶 中 | 部署旧版 JAR 导致功能缺失 | 建议加 sha256 / version stamp 验证部署流程 |
 | 新表 DDL 执行失败 | 🟢 低 | 部署阻塞 | 手动 SQL 文件在灰度环境先验证；执行前备份 |
 | aiclaw 自动入群误判 | 🟢 低 | 非 aiclaw 被自动入群 | 查询 aiclaw 列表时加 Redis 缓存 + DB 双校验 |
 | thinking content 过大 | 🟢 低 | TEXT 字段存储压力 | 设置 content 上限（如 64KB），超限截断 |
@@ -927,14 +1024,19 @@ public class ThinkingEventHandler {
 
 ## 附录：文件清单
 
-| 文件 | 路径 |
-|------|------|
-| design-server.md | `teamdocs/active/REQ-004-group_chat-群聊/` |
-| im_aiclaw_group_config DDL | `luohuo-im/luohuo-im-biz/src/main/resources/db/changelog/` |
-| AiclawGroupConfig.java | `luohuo-im/luohuo-im-entity/...` |
-| AiclawThinking.java | `luohuo-im/luohuo-im-entity/...` |
-| AiclawGroupConfigController.java | `luohuo-im/luohuo-im-controller/...` |
-| AiclawThinkingCleanJob.java | `luohuo-im/luohuo-im-biz/...` |
-| WSReqTypeEnum.java | `luohuo-model/...` |
-| WSRespTypeEnum.java | `luohuo-model/...` |
-| ThinkingEventHandler.java | `luohuo-im/luohuo-im-biz/...` |
+| 文件 | 路径 | 说明 |
+|------|------|------|
+| design-server.md | `teamdocs/active/REQ-004-group_chat-群聊/` | 本文档 |
+| im_aiclaw_group_config DDL | `luohuo-im/luohuo-im-biz/src/main/resources/db/changelog/` | 群配置表 DDL |
+| AiclawGroupConfig.java | `luohuo-im/luohuo-im-entity/...` | 群配置 Entity |
+| AiclawThinking.java | `luohuo-im/luohuo-im-entity/...` | Thinking Entity |
+| AiclawGroupConfigController.java | `luohuo-im/luohuo-im-controller/.../chat/` | 群配置 REST API |
+| AiclawGroupConfigServiceImpl.java | `luohuo-im/luohuo-im-biz/.../impl/` | 群配置 Service（含 Redis 缓存） |
+| AiclawRateLimitChecker.java | `luohuo-ws/luohuo-ws-biz/.../service/` | 限流校验器（读 Redis 配置） |
+| ThinkingProcessor.java | `luohuo-ws/luohuo-ws-biz/.../processor/` | Thinking WS 事件处理（含 thinkingId fallback） |
+| ThinkingController.java | `luohuo-im/luohuo-im-controller/...` | Thinking REST API（ws-server 内部调用） |
+| ThinkingService.java | `luohuo-im/luohuo-im-biz/.../service/` | Thinking 业务逻辑 |
+| SessionManager.java | `luohuo-ws/luohuo-ws-biz/.../websocket/` | WS 会话管理（含 cleanupSession 修复） |
+| WSReqTypeEnum.java | `luohuo-model/...` | WS 请求类型枚举 |
+| WSRespTypeEnum.java | `luohuo-model/...` | WS 响应类型枚举 |
+| AiclawThinkingCleanJob.java | `luohuo-im/luohuo-im-biz/...` | XXL-Job 清理任务 |
