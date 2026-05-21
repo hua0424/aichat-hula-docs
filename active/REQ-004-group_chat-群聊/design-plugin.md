@@ -946,6 +946,7 @@ private sendAutoReply(roomId: number, reason: string): void {
 
 **autoReply 行为约束**：
 - `sendAutoReply` 是 fire-and-forget（异步发送，不等待响应），快速连续 error 时可能发送多条 autoReply——可接受，server 不计入限流统计
+- **thinkingId 缺失时的 fallback**：若 server 异常导致 thinkingEnd 未携带 thinkingId，plugin 用 `fromUid+roomId` 匹配 session 作为 belt-and-suspenders 保障（防止限流场景下 autoReply 漏发）
 
 ---
 
