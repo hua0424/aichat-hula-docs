@@ -944,6 +944,9 @@ private sendAutoReply(roomId: number, reason: string): void {
 4. 其他 aiclaw 的 aichat-node 收到后检查 payload 中的 autoReply 标记，跳过 agent loop
 5. 前端可选择性展示 autoReply 消息（如灰色提示条）
 
+**autoReply 行为约束**：
+- `sendAutoReply` 是 fire-and-forget（异步发送，不等待响应），快速连续 error 时可能发送多条 autoReply——可接受，server 不计入限流统计
+
 ---
 
 ### F. WS 协议
