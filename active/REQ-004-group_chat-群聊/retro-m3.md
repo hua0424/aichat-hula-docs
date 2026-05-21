@@ -217,3 +217,22 @@ plugin 调 hula_send_message
 **M4 启动前提**：
 - M3 backend-tester + ui-tester 提测通过
 - 修复所有 M3 提测发现的 P0/P1 缺陷
+
+---
+
+## 九、M3 提测闭环（2026-05-20 当晚）
+
+| 测试方 | 报告 | 发现 | 修复 | 状态 |
+|--------|------|------|------|------|
+| backend-tester | `test-m3-report.md` (commit `562b1c4`) | 全部通过（4/4 TC + 跨组协议一致性 + Redis 缓存 + token 鉴权）；WS 自动化 E2E 未执行（网关 WS 代理 protocol error，独立 infra 问题，已建议转 server-dev 跟踪） | — | ✅ |
+| ui-tester | `test-m3-ui-report.md` (commit `febbb3e`) | P1 ×1：layout/index.vue 缺 AICLAW_GROUP_CONFIG_UPDATE Mitt handler；6 项通过（桌面+移动 UI + autoReply + i18n + 限流 + M2 回归） | frontend-dev commit `9389a507c` | ✅ 复测通过 |
+
+**M3 整体闭环。M4 已可启动（含网关 WS 代理 protocol error 跟踪 + 深度 GUI 测试账号准备）。**
+
+### 沉淀 7：测试基础设施问题与功能验证解耦
+
+**事件**：backend-tester 自动化 WS E2E 测试受阻于网关 WebSocket 代理 protocol error（独立 infra 问题，非 REQ-004 引入）。
+
+→ **规则**：自动化测试受阻于**基础设施层问题**（网关代理、容器网络、CI 流水线等）时，**不阻塞**功能里程碑准入。改用「代码审查 + 日志验证 + GUI 实测」组合覆盖核心逻辑，把基础设施问题作为独立 issue 转给对应方跟踪。
+
+同时给后续阶段留下「待用 GUI/实操覆盖的功能点清单」，确保不漏测：本次为限流边界 / THINKING_START 前置限流 / 短回复 skip 触发 → 已加入 M4 ui-tester 深度 GUI 测试覆盖清单。
