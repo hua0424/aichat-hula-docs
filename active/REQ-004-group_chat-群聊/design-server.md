@@ -3,7 +3,7 @@
 > Owner: server-dev  
 > 输入: [需求.md](需求.md) v2.1 + design-tasks.md §2.1  
 > 日期: 2026-05-20  
-> 状态: v1.4（M3：短回复 skip 服务端权威层）
+> 状态: v1.5（M4：限流 thinkingId 修复 + extra 层级精确化）
 
 ---
 
@@ -101,6 +101,8 @@ CREATE TABLE im_aiclaw_thinking (
     content          TEXT NOT NULL COMMENT '完整思考文本',
     duration_ms      INT COMMENT '处理耗时（毫秒），THINKING_END 时回填',
     has_response     TINYINT UNSIGNED DEFAULT 0 COMMENT '是否产生了回复消息：0=否，1=是',
+    status           TINYINT DEFAULT 0 COMMENT '状态：0=进行中 1=成功 2=错误 3=超时',
+    error_code       VARCHAR(64) DEFAULT NULL COMMENT '错误码（rate_limit_exceeded / daily_limit_exceeded / short_reply_skip / timeout）',
     is_del           TINYINT UNSIGNED DEFAULT 0 COMMENT '逻辑删除',
     create_time      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
     INDEX idx_aiclaw_room (aiclaw_uid, room_id),
@@ -363,12 +365,15 @@ plugins (aichat-node)
          │
          ▼
 ┌──────────────────────────────────────────────────────────┐
-│ ThinkingStart Handler                                    │
-│ 1. 【频率校验】Redis 检查 rate limit，超限 → 直接返回      │
-│    thinkingEnd { error: "rate_limit_exceeded" } 给 plugin │
-│    （不创建 thinking 记录，不触发 adapter.chat()）        │
-│ 2. 创建 thinking 记录（落库），生成 thinkingId            │
-│ 3. 广播 thinkingStart { thinkingId, fromUid, ... }        │
+│ ThinkingStart Handler (M4 修正)                          │
+│ 1. 创建 thinking 记录（落库），先生成 thinkingId          │
+│    （确保限流拒绝时 thinkingId 已存在，用于 plugin 路由） │
+│ 2. 【频率校验】Redis 检查 rate limit，超限 →              │
+│    - 更新 thinking 记录 status=2, error_code             │
+│    - 推 thinkingEnd { thinkingId, error: "rate_limit_..."}│
+│      给 plugin（含有效 thinkingId，plugin 可路由 autoReply）│
+│    - 不触发 adapter.chat()                               │
+│ 3. 限流通过 → 广播 thinkingStart { thinkingId, ... }      │
 │    到群内所有成员（含该 aiclaw 自己）                      │
 └────────────────────────┬─────────────────────────────────┘
                          │
@@ -402,13 +407,15 @@ plugins (aichat-node)
 - plugin 侧收到 thinkingStart 后，通过匹配 `fromUid === selfUid` 识别是自己的 session，从中提取 `thinkingId`
 - 后续 THINKING_DELTA/END 的入参携带该 `thinkingId`，server 通过 thinkingId 反查 roomId 和 thinking 记录
 
-**频率校验前置（S2）：**
-- THINKING_START Handler 中**优先执行频率校验**（Redis 滑动窗口计数器）
-- 若超限，不创建 thinking 记录、不触发后续 agent loop，直接返回 `THINKING_END` 错误事件给该 aiclaw：
+**频率校验前置（S2）—— M4 修正：**
+- THINKING_START Handler 中**先创建 thinking 记录生成 thinkingId**，再做频率校验（Redis 滑动窗口计数器）
+- 若超限，更新 thinking 记录 `status=2, error_code="rate_limit_exceeded"`，然后推 `THINKING_END` 错误事件给该 aiclaw：
   ```json
-  { "type": 22, "data": { "thinkingId": null, "error": "rate_limit_exceeded" } }
+  { "type": 22, "data": { "thinkingId": "186xxxxxxxx", "status": "error", "error": "rate_limit_exceeded" } }
   ```
+- plugin 端通过 `thinkingId` 匹配 active session，再按 `error` code 触发对应 `sendAutoReply`
 - 此举避免 agent loop 启动后（GPU/CPU 消耗）才发现被限流，与 plugin-dev 的 AntiLoopGuard 配合形成双层过滤
+- thinking 记录保留 `status` + `error_code`，便于运维统计限流发生频率
 
 **DTO 设计：**
 
@@ -522,19 +529,23 @@ public static class Message {
 }
 ```
 
-**autoReply 在 WS payload 中的层级位置（I3 明确）：**
-- `extra` 是 `ChatMessageResp.Message` 的**顶层字段**（与 `body`、`messageMarks` 同级）
+**autoReply 在 WS payload 中的层级位置（I3 明确，M4 精确化）：**
+- `extra` 是 `ChatMessageResp.Message` 的**字段**（与 `body`、`messageMarks` 同级）
+- WS payload 中精确路径为 **`data.message.extra.autoReply`**（不是 `data.extra.autoReply`）
 - 不是放在 body 内部
-- 示例：
+- 示例（完整 WS payload）：
   ```json
   {
-    "fromUser": { "uid": "10001" },
-    "message": {
-      "id": "12345",
-      "roomId": "30001",
-      "type": 1,
-      "body": { "content": "触发频率限制，本分钟内无法回复" },
-      "extra": { "autoReply": true, "reason": "rate_limit" }
+    "type": "receiveMessage",
+    "data": {
+      "fromUser": { "uid": "10001", "name": "aiclaw-bot" },
+      "message": {
+        "id": "12345",
+        "roomId": "30001",
+        "type": 1,
+        "body": { "content": "触发频率限制，本分钟内无法回复" },
+        "extra": { "autoReply": true, "thinkingId": "186xxx" }
+      }
     }
   }
   ```
@@ -662,11 +673,13 @@ LIMIT #{limit}
 3. aichat-node 收到 `thinkingEnd(error=short_reply_skip)` 后触发 `sendAutoReply`
 
 **Error Code 约定**（供 plugin-dev 参考）：
-| Error Code | 场景 | 触发位置 |
-|-----------|------|---------|
-| `rate_limit_exceeded` | 频率超限（10条/分钟） | ws-biz ThinkingProcessor |
-| `daily_limit_exceeded` | 日限超限（1000条） | ws-biz ThinkingProcessor |
-| `short_reply_skip` | 连续短回复跳过 | im-biz ChatServiceImpl |
+| Error Code | 场景 | 触发位置 | thinkingId |
+|-----------|------|---------|------------|
+| `rate_limit_exceeded` | 频率超限（10条/分钟） | ws-biz ThinkingProcessor | **有**（M4 修正：先 create thinking 再限流检查） |
+| `daily_limit_exceeded` | 日限超限（1000条） | ws-biz ThinkingProcessor | **有**（同上） |
+| `short_reply_skip` | 连续短回复跳过 | im-biz ChatServiceImpl | 有（从 `request.extra.thinkingId` 透传） |
+
+> M4 关键修正：限流拒绝场景下 thinkingEnd 必须携带有效 `thinkingId`，plugin 端才能通过 `thinkingId` 匹配 active session 并触发对应 `sendAutoReply`。因此 ThinkingProcessor 在限流检查**之前**先调用 `createThinkingViaHttp` 生成 thinking 记录，拒绝时再 `markErrorViaHttp` 更新 `status=2` + `error_code`。
 
 ---
 
