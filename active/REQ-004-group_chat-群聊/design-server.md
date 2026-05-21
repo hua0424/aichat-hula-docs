@@ -3,7 +3,7 @@
 > Owner: server-dev  
 > 输入: [需求.md](需求.md) v2.1 + design-tasks.md §2.1  
 > 日期: 2026-05-20  
-> 状态: v1.6（M4 收尾：cleanupSession 修复 + RateLimitChecker Redis 缓存 + thinkingId fallback + API 路径补全）
+> 状态: v1.7（M4-2 完结：RetryPushConsumer 死会话保护 + cleanupSession 修复 + RateLimitChecker Redis 缓存 + thinkingId fallback + API 路径补全）
 
 ---
 
@@ -623,6 +623,42 @@ public void cleanupSession(WebSocketSession session) {
 **影响范围**：所有 WS 客户端断连场景（正常 close / 心跳超时 / 网络异常 / token 过期），修复前均存在 map 残留。
 
 > ⚠️ RetryPushConsumer 实际有 `maxReconsumeTimes = 3`（RocketMQ 限制），并非无限重试。但死会话导致每条消息都触发 1 次无效 retry，放大了表象。
+
+---
+
+#### 3.3.6 RetryPushConsumer 死会话保护（M4-2 修正）
+
+**问题**：`RetryPushConsumer` 在收到延迟重试消息时，对所有 uid 统一检查 in-flight set 并重新推送。若用户已下线（无活跃 WS 会话），重推必然失败，浪费 `maxReconsumeTimes = 3` 的宝贵重试次数。
+
+**修复**：重试前增加用户在线状态检查，已下线则直接清理 in-flight set，不再重推：
+
+```java
+public void onMessage(NodePushDTO message) {
+    String onlineUsersKey = PresenceCacheKeyBuilder.globalOnlineUsersKey().getKey();
+
+    deviceUserMap.values().forEach(uid -> {
+        // M4-2: 死会话保护 — 用户已下线则直接清理 in-flight，不再浪费重试
+        Boolean isOnline = cachePlusOps.zIsMember(onlineUsersKey, uid);
+        if (!Boolean.TRUE.equals(isOnline)) {
+            log.info("用户已下线，跳过重试并清理 in-flight: uid={}, hashId={}", uid, message.getHashId());
+            cachePlusOps.sRem(PassageMsgCacheKeyBuilder.build(uid), message.getHashId());
+            return;
+        }
+
+        Boolean exist = cachePlusOps.sIsMember(PassageMsgCacheKeyBuilder.build(uid), message.getHashId());
+        if (exist) {
+            // 仅在线用户才重推
+            pushService.sendPushMsg(message.getWsBaseMsg(), Arrays.asList(uid), message.getUid());
+            // ... contactDao.refreshOrCreateActive
+        }
+    });
+}
+```
+
+**设计要点**：
+- 使用 `globalOnlineUsersKey`（ZSET）判断用户是否在线，与 `SessionManager.syncOnline()` 维护的权威状态一致
+- 用户已下线时主动 `sRem` 清理 in-flight set，避免该消息 hash 长期残留
+- 仅对仍在线的用户执行 `sendPushMsg` + `contactDao.refreshOrCreateActive`
 
 ---
 
